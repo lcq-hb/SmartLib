@@ -1,0 +1,655 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SmartLib 演示控制台</title>
+<!--
+  ============================================================================
+  SmartLib 演示控制台（单文件、零依赖、离线可用）
+
+  为什么把它放在后端静态资源里（backend/src/main/resources/static/demo.html）：
+      浏览器有同源策略。页面调用 /api/** 与 /actuator/** 时，如果页面来自
+      file:// 或另一个端口，就属于跨域，而没有 CORS 配置的后端会直接拒绝，
+      演示会在第一步就崩。把这个文件放在后端自己的静态目录里，
+      页面地址 http://127.0.0.1:8080/demo.html 与接口同源，
+      对 /api/** 的调用**完全不需要 CORS**。
+
+      唯一仍然跨域的是 Agent 服务（8000 端口），
+      因此只为它加了一段可配置的 CORS（见 app/main.py 的 CORSMiddleware）。
+
+  为什么用原生 JS 而不引框架/CDN：
+      面试演示环境可能断网，任何外部依赖都是失败点。
+      这个页面不加载任何外部资源，双击文件也能显示（但那样会跨域，见上）。
+
+  设计原则：每一步都要能**自证**——按钮旁边直接显示 HTTP 状态码、
+  耗时、trace_id 与原始 JSON。演示时不需要打开浏览器开发者工具。
+  ============================================================================
+-->
+<style>
+  :root {
+    --bg: #0f1419;
+    --card: #171c23;
+    --card2: #1d232b;
+    --line: #2a313b;
+    --fg: #dfe6ee;
+    --dim: #8b97a6;
+    --acc: #4aa3ff;
+    --ok: #35c46b;
+    --warn: #e0a63a;
+    --err: #f0555b;
+    --mono: Consolas, "Cascadia Mono", "Courier New", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 18px 20px 60px;
+    background: var(--bg); color: var(--fg);
+    font: 14px/1.6 "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+  }
+  h1 { font-size: 19px; margin: 0 0 4px; font-weight: 600; }
+  h2 { font-size: 15px; margin: 0 0 10px; font-weight: 600; color: #fff; }
+  .sub { color: var(--dim); font-size: 12.5px; margin-bottom: 14px; }
+  .pills { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }
+  .pill {
+    padding: 3px 10px; border-radius: 99px; font-size: 12px;
+    border: 1px solid var(--line); background: var(--card2); color: var(--dim);
+  }
+  .pill.ok { color: var(--ok); border-color: #1f5c38; background: #10241a; }
+  .pill.bad { color: var(--err); border-color: #63262a; background: #291315; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(430px, 1fr)); gap: 14px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 9px; padding: 14px 15px 15px; }
+  .card.wide { grid-column: 1 / -1; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 9px; }
+  label { color: var(--dim); font-size: 12.5px; min-width: 62px; }
+  input[type=text], input[type=number], textarea, select {
+    background: #0c1015; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 9px; font-family: inherit; font-size: 13px;
+  }
+  input[type=text] { flex: 1; min-width: 120px; }
+  input[type=number] { width: 78px; }
+  textarea { width: 100%; min-height: 56px; resize: vertical; font-size: 13.5px; }
+  select { min-width: 190px; }
+  button {
+    background: var(--card2); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 12px; font-family: inherit; font-size: 13px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--acc); color: #fff; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: #12395f; border-color: #1d5f9c; color: #dcecff; }
+  button.primary:hover:not(:disabled) { background: #16497a; }
+  .meta { font-size: 12px; color: var(--dim); font-family: var(--mono); margin: 4px 0 8px; }
+  .verdict { font-size: 13px; padding: 7px 10px; border-radius: 6px; margin: 8px 0; display: none; }
+  .verdict.ok { display: block; background: #10241a; border: 1px solid #1f5c38; color: #9ff0c0; }
+  .verdict.bad { display: block; background: #291315; border: 1px solid #63262a; color: #ffb3b6; }
+  pre {
+    background: #0c1015; border: 1px solid var(--line); border-radius: 6px;
+    padding: 9px 10px; margin: 0; max-height: 260px; overflow: auto;
+    font-family: var(--mono); font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-all;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 6px; }
+  th, td { text-align: left; padding: 5px 7px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--dim); font-weight: 500; }
+  .tag { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11.5px; font-family: var(--mono); }
+  .tag.ok { background: #12341f; color: #7ee2a8; }
+  .tag.no { background: #3a1618; color: #ff9ea1; }
+  .hint { color: var(--dim); font-size: 12px; margin-top: 8px; }
+  code { font-family: var(--mono); background: #0c1015; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  #progress { font-family: var(--mono); font-size: 12.5px; color: #b9c6d4; min-height: 20px; }
+</style>
+</head>
+<body>
+
+<h1>SmartLib · 演示控制台</h1>
+<div class="sub">
+  Java 后端（8080）+ Python Agent（8000）· 所有数字都来自真实服务 · 每步都显示 HTTP 状态码、耗时与 trace_id
+</div>
+
+<div class="pills">
+  <span class="pill" id="pillBackend">后端 /actuator/health：检测中…</span>
+  <span class="pill" id="pillAgent">Agent /health：检测中…</span>
+  <button id="btnRecheck" style="padding:2px 10px;font-size:12px;">重新检测</button>
+  <span class="pill" id="pillStrategy">当前库存策略：-</span>
+</div>
+
+<div class="card wide" style="margin-bottom:14px;">
+  <h2>▶ 一键演示（推荐开场用）</h2>
+  <div class="row">
+    <button class="primary" id="btnRunAll">按顺序跑：检索 → 拼音 → 借书幂等 → 对账 → Agent 对话</button>
+  </div>
+  <div id="progress">待运行。</div>
+</div>
+
+<div class="grid">
+
+  <!-- ==================== 1. 检索 ==================== -->
+  <div class="card">
+    <h2>1 · 书目检索（自研倒排索引）</h2>
+    <div class="row">
+      <label>关键词</label>
+      <input type="text" id="searchQuery" value="计算机网络">
+      <button class="primary" id="btnSearch">中文检索</button>
+      <button id="btnPinyin">拼音首字母 jsjwl</button>
+    </div>
+    <div class="meta" id="searchMeta"></div>
+    <div id="searchTable"></div>
+    <div class="hint">
+      下方对比：把关键词换成 <code>计算机网络</code> 与 <code>jsjwl</code>，两次都能命中同名书。
+      拼音首字母靠 GB2312 区位码区间推声母，不依赖拼音词典。
+    </div>
+  </div>
+
+  <!-- ==================== 2. 借书幂等 ==================== -->
+  <div class="card">
+    <h2>2 · 借书幂等（同一个 Key 只扣一次库存）</h2>
+    <div class="row">
+      <label>读者 ID</label><input type="number" id="readerId" value="1">
+      <label>书目 ID</label><input type="number" id="bookId" value="5">
+      <button id="btnPickBook">自动选一本可借的</button>
+    </div>
+    <div class="row">
+      <label>幂等键</label><input type="text" id="idemKey" readonly>
+    </div>
+    <div class="row">
+      <button class="primary" id="btnBorrow1">第 1 次借书</button>
+      <button class="primary" id="btnBorrow2">用同一个 Key 再借一次</button>
+    </div>
+    <div class="verdict" id="borrowVerdict"></div>
+    <div class="meta" id="borrowMeta"></div>
+    <pre id="borrowResult">尚未请求。</pre>
+    <div class="hint">
+      第二次必须返回 <code>idempotentReplay: true</code> 且 <code>borrowId</code> 与第一次相同 —— 这是"重复提交只生效一次"的证据。
+      H2 是内存库，<b>重启后端即恢复演示数据</b>；同一读者对同一本书只能持 1 册，所以重复演示请点"自动选一本可借的"。
+    </div>
+  </div>
+
+  <!-- ==================== 3. 对账与策略 ==================== -->
+  <div class="card">
+    <h2>3 · 零超卖的证据：库存对账 + 六策略切换</h2>
+    <div class="row">
+      <button class="primary" id="btnReconcile">查询对账</button>
+      <span class="meta" id="reconcileMeta" style="margin:0;"></span>
+    </div>
+    <div class="verdict" id="reconcileVerdict"></div>
+    <pre id="reconcileResult">尚未请求。</pre>
+    <div class="row" style="margin-top:10px;">
+      <label>切换策略</label>
+      <select id="strategySelect"></select>
+      <button id="btnSwitchStrategy">切换（不重启）</button>
+    </div>
+    <div class="meta" id="strategyMeta"></div>
+    <div class="row">
+      <button id="btnStats">检索引擎与缓存统计</button>
+    </div>
+    <pre id="statsResult">尚未请求。</pre>
+    <div class="hint">
+      对账返回 <code>consistent: true</code> 表示 <code>sum(stock_ledger.delta)</code> 与库存变化量完全一致、且无负库存 ——
+      这是"零超卖"的自动化证据，也是发现"有人绕过唯一扣减入口"的最后一道防线。
+    </div>
+  </div>
+
+  <!-- ==================== 4. 我的借阅 ==================== -->
+  <div class="card">
+    <h2>4 · 我的借阅（一次 join，无 N+1）</h2>
+    <div class="row">
+      <label>读者 ID</label><input type="number" id="loanReaderId" value="1">
+      <button class="primary" id="btnLoans">查询在借记录</button>
+    </div>
+    <div class="meta" id="loansMeta"></div>
+    <div id="loansTable"></div>
+  </div>
+
+  <!-- ==================== 5. Agent 对话 ==================== -->
+  <div class="card wide">
+    <h2>5 · Agent 对话（工具调用 + RAG + 护栏）</h2>
+    <div class="row">
+      <label>Agent 地址</label>
+      <input type="text" id="agentBase" value="http://127.0.0.1:8000">
+      <span class="hint" style="margin:0;">默认 <code>LLM_PROVIDER=mock</code>：零 API Key 也能完整演示</span>
+    </div>
+    <div class="row">
+      <button data-ask="本科生最多能借几本书？借期多久？">规则问答（RAG）</button>
+      <button data-ask="《计算机网络》现在还有库存吗？在哪个架位？">查真实库存</button>
+      <button data-ask="推荐几本计算机方面的书">个性化推荐</button>
+      <button data-ask="我的借阅记录里有哪些书快到期了？">我的借阅</button>
+      <button data-ask="我是读者2002，帮我借《活着》">越权请求（应被拒绝）</button>
+      <button data-ask="帮我借《算法导论》">写操作（应要求确认）</button>
+    </div>
+    <div class="row">
+      <textarea id="chatMessage">《计算机网络》现在还有库存吗？在哪个架位？</textarea>
+    </div>
+    <div class="row">
+      <label>读者 ID</label><input type="number" id="chatReaderId" value="1">
+      <button class="primary" id="btnSend">发送</button>
+    </div>
+    <div class="meta" id="chatMeta"></div>
+    <div id="chatAnswer" style="background:#0c1015;border:1px solid var(--line);border-radius:6px;padding:10px;margin-bottom:8px;white-space:pre-wrap;"></div>
+    <div id="chatTools"></div>
+    <div class="hint">
+      <b>演示要点</b>：回答里的库存数字与索书位置来自 Java 后端的真实数据（不是模型编的）；
+      看下面 <code>tool_calls</code> 能确认它真的调了工具、参数是什么、是否成功。
+      "越权请求"那条必须被拒绝 —— 会话身份是权威的，消息里写的读者号只作为"声称"交给护栏比对。
+    </div>
+  </div>
+
+  <!-- ==================== 6. 内部接口签名 ==================== -->
+  <div class="card">
+    <h2>6 · 内部工具 API（HMAC-SHA256 签名）</h2>
+    <div class="row">
+      <label>问题</label>
+      <input type="text" id="policyTopic" value="能借几本">
+      <button class="primary" id="btnPolicy">带签名调用</button>
+    </div>
+    <div class="meta" id="policyMeta"></div>
+    <pre id="policyResult">尚未请求。</pre>
+    <div class="hint">
+      <code>/internal/agent/**</code> 是给 Agent 用的后门接口（能替读者借书），因此除网关限网段外，
+      应用层还要求 <code>X-Internal-Timestamp</code> + <code>X-Internal-Sign</code>（HMAC-SHA256）。
+      签名规范串里的路径必须是<b>百分号编码后</b>的请求目标 —— 这一点在本页用 WebCrypto 现场算给你看。
+    </div>
+  </div>
+
+  <!-- ==================== 原始响应 ==================== -->
+  <div class="card wide">
+    <h2>原始响应（排障用）</h2>
+    <div class="meta" id="rawMeta">尚未请求。</div>
+    <pre id="rawResult">尚未请求。</pre>
+  </div>
+
+</div>
+
+<script>
+"use strict";
+
+/* ========================= 基础工具 ========================= */
+
+const $ = (id) => document.getElementById(id);
+const API = "";                       // 后端：与页面同源
+const agentBase = () => ($("agentBase").value || "").trim().replace(/\/+$/, "");
+
+function setRaw(label, obj, status, costMs) {
+  $("rawMeta").textContent = label + (status !== undefined ? ("  HTTP " + status) : "")
+    + (costMs !== undefined ? ("  " + costMs + " ms") : "");
+  $("rawResult").textContent = typeof obj === "string" ? obj : JSON.stringify(obj, null, 2);
+}
+
+function esc(v) {
+  return String(v === null || v === undefined ? "" : v)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function verdict(el, ok, text) {
+  el.className = "verdict " + (ok ? "ok" : "bad");
+  el.textContent = text;
+}
+
+/** 统一请求：返回 {status, ok, body, text, ms}；绝不抛异常，错误也当结果返回。 */
+async function call(url, options) {
+  const opt = options || {};
+  const t0 = performance.now();
+  try {
+    const resp = await fetch(url, {
+      method: opt.method || "GET",
+      headers: opt.headers || {},
+      body: opt.body
+    });
+    const text = await resp.text();
+    let body = text;
+    try { body = JSON.parse(text); } catch (e) { /* 非 JSON 就保留原文 */ }
+    return { status: resp.status, ok: resp.ok, body: body, text: text, ms: Math.round(performance.now() - t0) };
+  } catch (e) {
+    return {
+      status: 0, ok: false, body: null, ms: Math.round(performance.now() - t0),
+      text: "请求失败：" + e.message + "\n\n常见原因：1) 服务没起来  2) 页面不是从 http://127.0.0.1:8080/demo.html 打开的（跨域）"
+    };
+  }
+}
+
+/* ========================= 状态检测 ========================= */
+
+async function refreshStatus() {
+  const hb = await call(API + "/actuator/health");
+  const backendOk = hb.ok && hb.body && hb.body.status === "UP";
+  $("pillBackend").className = "pill " + (backendOk ? "ok" : "bad");
+  $("pillBackend").textContent = "后端 /actuator/health：" + (backendOk ? "UP" : (hb.status ? ("HTTP " + hb.status) : "不可达"));
+
+  const ha = await call(agentBase() + "/health");
+  const agentOk = ha.ok && ha.body && (ha.body.status === "ok" || ha.body.status === "UP");
+  $("pillAgent").className = "pill " + (agentOk ? "ok" : "bad");
+  $("pillAgent").textContent = "Agent /health：" + (agentOk
+    ? ("正常 · 工具 " + (ha.body.tools || "?") + " 个 · LLM " + (ha.body.llm_provider || "?"))
+    : (ha.status ? ("HTTP " + ha.status) : "不可达（第 5 步需要它）"));
+
+  const hs = await call(API + "/api/admin/stock-strategy");
+  if (hs.ok && hs.body && hs.body.data) {
+    $("pillStrategy").className = "pill ok";
+    $("pillStrategy").textContent = "当前库存策略：" + hs.body.data.current;
+    fillStrategies(hs.body.data.available || [], hs.body.data.current);
+  } else {
+    $("pillStrategy").className = "pill bad";
+    $("pillStrategy").textContent = "当前库存策略：读不到（本地 profile 需 smartlib.admin.enabled=true）";
+  }
+}
+
+function fillStrategies(list, current) {
+  const sel = $("strategySelect");
+  if (sel.options.length === list.length && sel.dataset.src === list.join(",")) {
+    sel.value = current; return;
+  }
+  sel.dataset.src = list.join(",");
+  sel.innerHTML = list.map((n) => '<option value="' + esc(n) + '">' + esc(n) + '</option>').join("");
+  sel.value = current;
+}
+
+/* ========================= 1. 检索 ========================= */
+
+function renderBooks(rows) {
+  if (!rows || !rows.length) { return '<div class="hint">无结果。</div>'; }
+  return '<table><thead><tr><th>ID</th><th>书名</th><th>作者</th><th>可借/总</th><th>索书位置</th></tr></thead><tbody>'
+    + rows.map((b) => '<tr><td>' + esc(b.id) + '</td><td>' + esc(b.title) + '</td><td>' + esc(b.author)
+      + '</td><td><b>' + esc(b.availableCopies) + '</b>/' + esc(b.totalCopies) + '</td><td>' + esc(b.shelfLocation) + '</td></tr>').join("")
+    + '</tbody></table>';
+}
+
+async function doSearch(query, label) {
+  const url = API + "/api/books?query=" + encodeURIComponent(query) + "&size=6";
+  const r = await call(url);
+  const data = (r.body && r.body.data) || {};
+  $("searchMeta").textContent = label + "  query=" + query + "  HTTP " + r.status + "  " + r.ms + "ms"
+    + "  total=" + (data.total === undefined ? "?" : data.total) + "  traceId=" + ((r.body && r.body.traceId) || "-");
+  $("searchTable").innerHTML = renderBooks(data.list);
+  setRaw("检索 " + query, r.body || r.text, r.status, r.ms);
+  return r;
+}
+
+/* ========================= 2. 借书幂等 ========================= */
+
+function newIdemKey() {
+  const k = (window.crypto && crypto.randomUUID) ? crypto.randomUUID().replace(/-/g, "").slice(0, 20)
+    : ("k" + Date.now() + Math.random().toString(36).slice(2, 8));
+  $("idemKey").value = "demo-" + k;
+}
+
+async function doBorrow(which) {
+  const readerId = parseInt($("readerId").value, 10);
+  const bookId = parseInt($("bookId").value, 10);
+  const key = $("idemKey").value;
+  const r = await call(API + "/api/borrows", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Idempotency-Key": key },
+    body: JSON.stringify({ readerId: readerId, bookId: bookId })
+  });
+  const body = r.body || {};
+  const d = body.data || {};
+  $("borrowMeta").textContent = which + "  HTTP " + r.status + "  " + r.ms + "ms"
+    + "  traceId=" + (body.traceId || "-") + "  Idempotency-Key=" + key;
+  $("borrowResult").textContent = JSON.stringify(r.body || r.text, null, 2);
+  setRaw("借书（" + which + "）", r.body || r.text, r.status, r.ms);
+  return r;
+}
+
+function judgeIdempotency(first, second) {
+  const d1 = (first.body && first.body.data) || {};
+  const d2 = (second.body && second.body.data) || {};
+  if (first.status !== 200) {
+    verdict($("borrowVerdict"), false, "第 1 次就没成功（HTTP " + first.status + "："
+      + ((first.body && first.body.msg) || first.text) + "）。换一本可借的书或重启后端再试。");
+    return;
+  }
+  if (second.status !== 200) {
+    verdict($("borrowVerdict"), false, "第 2 次失败（HTTP " + second.status + "）—— 幂等没生效，需要排查。");
+    return;
+  }
+  const sameId = d1.borrowId === d2.borrowId;
+  const replay = d2.idempotentReplay === true;
+  verdict($("borrowVerdict"), sameId && replay,
+    "第 1 次：borrowId=" + d1.borrowId + "（idempotentReplay=" + d1.idempotentReplay + "）　"
+    + "第 2 次：borrowId=" + d2.borrowId + "（idempotentReplay=" + d2.idempotentReplay + "）　"
+    + "结论：" + (sameId && replay ? "同一个 Key 只扣了一次库存 ✔" : "不符合预期，请检查幂等实现 ✘"));
+}
+
+/** 自动挑一本"该读者还没借、且当前可借"的书，避免演示时撞业务规则。 */
+async function pickAvailableBook() {
+  const readerId = parseInt($("readerId").value, 10);
+  const loans = await call(API + "/api/readers/" + readerId + "/loans?limit=100");
+  const held = new Set(((loans.body && loans.body.data) || [])
+    .filter((x) => x.status === "BORROWED" || x.status === "OVERDUE").map((x) => x.bookId));
+  const books = await call(API + "/api/books?availableOnly=true&size=50");
+  const list = ((books.body && books.body.data) || {}).list || [];
+  const pick = list.find((b) => !held.has(b.id));
+  if (pick) {
+    $("bookId").value = pick.id;
+    $("borrowMeta").textContent = "已自动选中：《" + pick.title + "》（可借 " + pick.availableCopies + "/" + pick.totalCopies + "）";
+  } else {
+    $("borrowMeta").textContent = "没有找到该读者还能借的可借书目，可换个读者 ID 或重启后端恢复数据。";
+  }
+  newIdemKey();
+}
+
+/* ========================= 3. 对账与策略 ========================= */
+
+async function doReconcile() {
+  const r = await call(API + "/api/admin/reconcile");
+  const d = (r.body && r.body.data) || {};
+  $("reconcileMeta").textContent = "HTTP " + r.status + "  " + r.ms + "ms  traceId=" + ((r.body && r.body.traceId) || "-");
+  $("reconcileResult").textContent = JSON.stringify(r.body || r.text, null, 2);
+  verdict($("reconcileVerdict"), d.consistent === true,
+    d.consistent === true
+      ? "consistent = true，违规书目 " + d.violationCount + " 条：库存与流水守恒、无负库存 ✔"
+      : "对账不通过！违规书目：" + JSON.stringify(d.violations) + " ✘");
+  setRaw("库存对账", r.body || r.text, r.status, r.ms);
+  return r;
+}
+
+async function doSwitchStrategy() {
+  const name = $("strategySelect").value;
+  const r = await call(API + "/api/admin/stock-strategy?name=" + encodeURIComponent(name), { method: "PUT" });
+  const d = (r.body && r.body.data) || {};
+  $("strategyMeta").textContent = "HTTP " + r.status + "  " + r.ms + "ms  " + d.previous + " -> " + d.current;
+  $("pillStrategy").textContent = "当前库存策略：" + (d.current || "-");
+  setRaw("切换库存策略", r.body || r.text, r.status, r.ms);
+  return r;
+}
+
+async function doStats() {
+  const r = await call(API + "/api/admin/search/stats");
+  $("statsResult").textContent = JSON.stringify(r.body || r.text, null, 2);
+  setRaw("检索引擎统计", r.body || r.text, r.status, r.ms);
+  return r;
+}
+
+/* ========================= 4. 我的借阅 ========================= */
+
+async function doLoans() {
+  const readerId = parseInt($("loanReaderId").value, 10);
+  const r = await call(API + "/api/readers/" + readerId + "/loans?limit=20");
+  const rows = (r.body && r.body.data) || [];
+  $("loansMeta").textContent = "HTTP " + r.status + "  " + r.ms + "ms  共 " + rows.length + " 条  traceId=" + ((r.body && r.body.traceId) || "-");
+  $("loansTable").innerHTML = rows.length
+    ? '<table><thead><tr><th>书名</th><th>应还</th><th>逾期天数</th><th>状态</th><th>可续借</th></tr></thead><tbody>'
+      + rows.map((x) => '<tr><td>' + esc(x.title) + '</td><td>' + esc((x.dueAt || "").replace("T", " ").slice(0, 19))
+        + '</td><td>' + esc(x.overdueDays) + '</td><td>' + esc(x.status) + '</td><td>'
+        + (x.renewable ? '<span class="tag ok">可</span>' : '<span class="tag no">否</span>') + '</td></tr>').join("")
+      + '</tbody></table>'
+    : '<div class="hint">该读者没有在借记录。</div>';
+  setRaw("我的借阅 reader=" + readerId, r.body || r.text, r.status, r.ms);
+  return r;
+}
+
+/* ========================= 5. Agent 对话 ========================= */
+
+function renderToolCalls(calls) {
+  if (!calls || !calls.length) { return '<div class="hint">本次没有工具调用（闲聊或规则直答）。</div>'; }
+  return '<table><thead><tr><th>工具</th><th>参数</th><th>结果</th><th>摘要</th></tr></thead><tbody>'
+    + calls.map((c) => {
+      const ok = c.ok === true;
+      return '<tr><td><code>' + esc(c.tool) + '</code></td><td><code>' + esc(JSON.stringify(c.arguments || {}))
+        + '</code></td><td>' + (ok ? '<span class="tag ok">OK</span>' : '<span class="tag no">' + esc(c.error_code || "FAIL") + '</span>')
+        + '</td><td>' + esc(c.summary || c.error_message || "") + (c.blocked_by ? ('<br><span class="hint">护栏：' + esc(c.blocked_by) + '</span>') : "") + '</td></tr>';
+    }).join("") + '</tbody></table>';
+}
+
+async function doChat() {
+  const msg = $("chatMessage").value.trim();
+  if (!msg) { return null; }
+  const readerId = parseInt($("chatReaderId").value, 10);
+  const r = await call(agentBase() + "/chat/sync", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reader_id: readerId, message: msg, session_id: "demo-console" })
+  });
+  const body = r.body || {};
+  const d = body.data || body;
+  $("chatMeta").textContent = "HTTP " + r.status + "  " + r.ms + "ms  intent=" + (d.intent || "-")
+    + "  trace_id=" + (d.trace_id || body.trace_id || "-");
+  // 注意：Agent 的回复字段是 reply（也兼容 answer/message），这里三个都兜住。
+  $("chatAnswer").textContent = d.reply || d.answer || d.message
+    || (r.ok ? "（无 reply 字段）" : ("请求失败：" + r.text));
+  $("chatTools").innerHTML = renderToolCalls(d.tool_calls || d.tools_used) + renderFlags(d);
+  setRaw("Agent 对话：" + msg, body, r.status, r.ms);
+  return r;
+}
+
+/** 把护栏与运行时标记单独摊开——这些是"Agent 工程化"最有说服力的证据。 */
+function renderFlags(d) {
+  const flags = [];
+  const add = (k, v, strong) => { if (v !== undefined && v !== null && v !== "" && !(Array.isArray(v) && !v.length)) { flags.push([k, v, strong]); } };
+  add("意图置信度", d.intent_confidence);
+  add("有工具证据", d.tool_evidence, true);
+  add("等待用户确认", d.pending_confirm, true);
+  add("护栏拦截", d.guardrail_notes, true);
+  add("降级", d.degraded, true);
+  add("转人工", d.handoff, true);
+  add("模式 / LLM", (d.mode || "-") + " / " + (d.provider || "-"));
+  add("步数 / 耗时", (d.steps === undefined ? "-" : d.steps) + " / " + (d.latency_ms === undefined ? "-" : d.latency_ms + "ms"));
+  add("RAG 来源", d.rag_sources);
+  if (!flags.length) { return ""; }
+  return '<div class="meta" style="margin-top:8px;">运行时标记：'
+    + flags.map(([k, v]) => {
+        const text = Array.isArray(v) ? v.join("；") : (typeof v === "object" ? JSON.stringify(v) : String(v));
+        const cls = (v === true) ? "tag ok" : "";
+        return '<span style="margin-right:12px;">' + esc(k) + '=<span class="' + cls + '">' + esc(text) + '</span></span>';
+      }).join("")
+    + '</div>';
+}
+
+/* ========================= 6. 内部接口 HMAC 签名 ========================= */
+
+const INTERNAL_SECRET = "dev-internal-secret-please-change"; // 与后端 application.yml 的默认值一致
+
+async function hmacHex(secret, message) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(message));
+  return Array.from(new Uint8Array(sig)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function doPolicy() {
+  const topic = $("policyTopic").value.trim();
+  // 关键：签名串与真正发出的 URL 必须是**同一个字符串**（都是百分号编码后的形式）。
+  // 后端用的是 request.getQueryString()，它拿到的是编码后的原始请求行。
+  const pathWithQuery = "/internal/agent/tools/policy?topic=" + encodeURIComponent(topic)
+    + "&readerType=UNDERGRAD";
+  const ts = Math.floor(Date.now() / 1000).toString();
+  const canonical = ts + "\n" + "GET" + "\n" + pathWithQuery + "\n";
+  let sign;
+  try {
+    sign = await hmacHex(INTERNAL_SECRET, canonical);
+  } catch (e) {
+    $("policyResult").textContent = "本浏览器不支持 WebCrypto（需要 https 或 localhost 环境）：" + e.message;
+    return null;
+  }
+  $("policyMeta").textContent = "canonical = timestamp \\n METHOD \\n pathWithQuery \\n body　（pathWithQuery 为编码后形式）";
+  const r = await call(API + pathWithQuery, {
+    headers: { "X-Internal-Timestamp": ts, "X-Internal-Sign": sign }
+  });
+  $("policyResult").textContent = JSON.stringify(r.body || r.text, null, 2)
+    + "\n\n----- 本次签名细节（可讲解）-----\n"
+    + "pathWithQuery = " + pathWithQuery + "\n"
+    + "canonical     = " + JSON.stringify(canonical) + "\n"
+    + "X-Internal-Sign = " + sign;
+  setRaw("内部签名接口（policy）", r.body || r.text, r.status, r.ms);
+  return r;
+}
+
+/* ========================= 一键演示 ========================= */
+
+function log(line) {
+  $("progress").textContent += "\n" + line;
+}
+
+async function runAll() {
+  $("progress").textContent = "开始一键演示…（每步都会在对应卡片里留下完整证据）";
+  $("btnRunAll").disabled = true;
+  try {
+    await refreshStatus();
+    log("[1/6] 检索《计算机网络》…");
+    const s = await doSearch("计算机网络", "中文检索");
+    log("      HTTP " + s.status + "，命中 " + (((s.body || {}).data || {}).total) + " 条；首条：" + ((((s.body || {}).data || {}).list || [{}])[0].title || "-"));
+
+    log("[2/6] 拼音首字母 jsjwl…");
+    const p = await doSearch("jsjwl", "拼音首字母");
+    log("      HTTP " + p.status + "，首条：" + ((((p.body || {}).data || {}).list || [{}])[0].title || "-"));
+
+    log("[3/6] 自动挑一本可借的书…");
+    await pickAvailableBook();
+    log("      选中 bookId=" + $("bookId").value);
+
+    log("[4/6] 借书两次（同一个幂等键）…");
+    const b1 = await doBorrow("第 1 次");
+    const b2 = await doBorrow("第 2 次（同 Key）");
+    judgeIdempotency(b1, b2);
+    const d1 = (b1.body || {}).data || {};
+    const d2 = (b2.body || {}).data || {};
+    log("      第 1 次 HTTP " + b1.status + " borrowId=" + d1.borrowId + "　第 2 次 HTTP " + b2.status
+      + " borrowId=" + d2.borrowId + " replay=" + d2.idempotentReplay);
+
+    log("[5/6] 库存对账…");
+    const rc = await doReconcile();
+    log("      consistent=" + (((rc.body || {}).data || {}).consistent));
+
+    log("[6/6] Agent 对话…");
+    const c = await doChat();
+    if (!c || c.status === 0) {
+      log("      Agent 不可达，跳过（第 5 步需要先启动 Agent 服务）");
+    } else {
+      const d = c.body && c.body.data ? c.body.data : (c.body || {});
+      log("      HTTP " + c.status + " intent=" + (d.intent || "-") + " 工具"
+        + ((d.tool_calls || []).length) + "个");
+      log("      回答：" + String(d.answer || "").replace(/\n/g, " ").slice(0, 120));
+    }
+    log("\n演示结束。可以指着各卡片里的 HTTP 状态码与原始 JSON 讲解。");
+  } catch (e) {
+    log("演示过程中出现异常：" + e.message);
+  } finally {
+    $("btnRunAll").disabled = false;
+  }
+}
+
+/* ========================= 事件绑定 ========================= */
+
+$("btnRecheck").onclick = refreshStatus;
+$("btnSearch").onclick = () => doSearch($("searchQuery").value.trim(), "中文检索");
+$("btnPinyin").onclick = () => { $("searchQuery").value = "jsjwl"; return doSearch("jsjwl", "拼音首字母"); };
+$("btnPickBook").onclick = pickAvailableBook;
+$("btnBorrow1").onclick = () => doBorrow("第 1 次");
+$("btnBorrow2").onclick = () => doBorrow("第 2 次（同 Key）");
+$("btnReconcile").onclick = doReconcile;
+$("btnSwitchStrategy").onclick = doSwitchStrategy;
+$("btnStats").onclick = doStats;
+$("btnLoans").onclick = doLoans;
+$("btnSend").onclick = doChat;
+$("btnPolicy").onclick = doPolicy;
+$("btnRunAll").onclick = runAll;
+$("searchQuery").addEventListener("keydown", (e) => { if (e.key === "Enter") { doSearch($("searchQuery").value.trim(), "中文检索"); } });
+$("chatMessage").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { doChat(); } });
+
+document.querySelectorAll("button[data-ask]").forEach((btn) => {
+  btn.onclick = () => { $("chatMessage").value = btn.getAttribute("data-ask"); doChat(); };
+});
+
+newIdemKey();
+refreshStatus();
+</script>
+</body>
+</html>

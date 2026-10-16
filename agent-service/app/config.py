@@ -43,6 +43,27 @@ class Settings(BaseSettings):
     port: int = 8000
     log_level: str = "INFO"
 
+    # ---------------- 跨域（只服务于本地演示控制台） ----------------
+    # 演示控制台是单页 HTML，放在后端静态资源里（http://127.0.0.1:8080/demo.html），
+    # 它调用本服务的 /chat/sync 属于跨域，因此这里白名单放行本机来源。
+    #
+    # 为什么用"逗号分隔的字符串"而不是 list[str]：
+    #   pydantic-settings 对复杂类型会按 **JSON** 解析环境变量，
+    #   写成 CORS_ORIGINS=http://a,http://b 会直接校验失败；
+    #   逗号分隔更符合运维直觉，拆解放在 cors_origin_list 里做。
+    # 为什么默认只放本机：
+    #   生产环境 Agent 只被网关调用，浏览器不该直连；
+    #   默认收紧、需要时显式配置，比默认放开安全。
+    cors_origins: str = (
+        "http://127.0.0.1:8080,http://localhost:8080,"
+        "http://127.0.0.1:5500,http://localhost:5500"
+    )
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        """把逗号分隔的配置拆成列表，容忍多余空格与空项。"""
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
     # ---------------- Agent 运行时 ----------------
     # hybrid = 规则路由 + LLM 兜底（蓝图 §6.4 G5），是默认模式
     agent_mode: AgentMode = "hybrid"

@@ -138,6 +138,38 @@ curl -N -X POST http://localhost:8000/chat \
 powershell -ExecutionPolicy Bypass -File scripts/start-local.ps1
 ```
 
+### 4.4 演示控制台（面试演示用）
+
+两个服务都起来之后，直接打开：
+
+**<http://127.0.0.1:8080/demo.html>**
+
+这是一个单文件、零外部依赖的演示控制台，把五个关键点做成按钮：
+
+| 卡片 | 演示什么 | 看得见的证据 |
+|---|---|---|
+| ▶ 一键演示 | 按顺序跑完全部 5 步 | 每步一行的进度日志 |
+| 1 书目检索 | 中文关键词 与 **拼音首字母 `jsjwl`** | 命中条数、耗时、traceId、结果表 |
+| 2 借书幂等 | 用**同一个 Idempotency-Key** 连发两次 | 第二次 `idempotentReplay: true` 且 `borrowId` 相同 |
+| 3 对账与策略 | `sum(stock_ledger.delta)` 守恒；六种策略**不重启切换** | `consistent: true`、`violationCount: 0` |
+| 4 我的借阅 | 一次 join 取回书名与应还日期 | 真实应还日期与逾期天数 |
+| 5 Agent 对话 | 工具调用 / RAG / 护栏 | `tool_calls`（工具名+真实参数+结果摘要）、意图置信度、护栏拦截、是否有工具证据 |
+| 6 内部接口签名 | 现场用 WebCrypto 算 HMAC-SHA256 | 完整签名规范串与签名值 |
+
+几个刻意的设计：
+
+- **页面放在后端的静态资源里**（`backend/src/main/resources/static/demo.html`），
+  因此页面地址与 `/api/**` 同源，**完全不需要 CORS**；只有调用 Agent（8000）是跨域的，
+  为此给 Agent 加了一段**白名单** CORS（默认只放本机，见 `agent-service/app/config.py` 的 `cors_origins`）。
+- **不引任何 CDN 或框架**：演示环境可能断网，外部依赖都是失败点。
+- **每步都显示 HTTP 状态码 / 耗时 / trace_id 与原始 JSON**，演示时不需要打开浏览器开发者工具。
+- 第 2 步提供"自动选一本可借的"按钮：它会查该读者当前在借、再查可借书目，
+  自动挑一本**没被该读者持有**的书 —— 避免演示时撞上"同一读者不能重复借同一本书"的规则。
+- 页面里那段 HMAC 签名与 Python 客户端、Java 服务端**三方算法一致**，已用固定向量交叉验证过。
+
+> 提示：H2 是内存库，**重启后端即恢复全部演示数据**。
+> 反复演示导致库存借空时，重启后端或换一本书即可。
+
 ---
 
 ## 5. 测试与基准

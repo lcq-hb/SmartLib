@@ -24,6 +24,7 @@ from typing import Any, AsyncIterator
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.agent.guardrail import Guardrail
@@ -183,6 +184,28 @@ def create_app(
     app.include_router(tools.router)
     app.include_router(recommend.router)
     app.include_router(admin.router)
+
+    # ---------------- 跨域：只给本地演示控制台开口子 ----------------
+    #
+    # 背景：演示控制台（backend 的静态页 /demo.html）与 Agent 不同源，
+    # 浏览器会先发 OPTIONS 预检；没有 CORS 时演示第一步就崩。
+    #
+    # 两个容易踩的点：
+    #   1. Starlette 的 add_middleware 是**插到最前面**（最外层），
+    #      所以这段写在 trace 中间件之后也仍然是外层 ——
+    #      预检请求由 CORS 直接应答，不会进入业务中间件，这是期望行为。
+    #   2. 白名单来自配置（默认只放本机），不是 "*"：
+    #      allow_origins=["*"] 会让任何网页都能调用这个能替读者借书的服务。
+    # expose_headers 让浏览器里的 JS 能读到 X-Trace-Id，演示时可以直接展示链路 ID。
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cfg.cors_origin_list,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+        allow_headers=["Content-Type", "X-Trace-Id", "X-Internal-Timestamp", "X-Internal-Sign"],
+        expose_headers=["X-Trace-Id"],
+    )
+    logger.info("CORS 白名单：%s", cfg.cors_origin_list)
     return app
 
 
