@@ -102,6 +102,38 @@ class IntentResult:
 #   而"在几楼/开放时间"才是知识；
 # - 检索放最后：书名号太容易被写操作与库存意图共享，不能靠它抢优先级。
 RULE_TABLE: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    # ---- 个人数据 ----
+    # 放在写操作与检索之前：含"借阅记录/我的借阅/信用分"的句子问的是**个人数据**，
+    # 不能被里面的"借"字或书名号抢成写操作/检索（实测："帮我查一下读者 1001 的借阅记录"
+    # 曾被判成 search_book，因为兜底书名抽取把"读者"当成了书名）。
+    (
+        "my_loans",
+        r"(?!.*(额度|还剩几本|能借几本|可以借几本))"
+        r"(我的借阅|我借了|借阅记录|查.{0,6}借阅|借了什么|还没还|什么时候到期|哪本快到期|"
+        r"在借记录|我有没有逾期|我的逾期|应还日期)",
+        # 刻意**不放"到期"**：它单独出现时既可能指"我的书什么时候到期"（查询），
+        # 也可能指"快到期了想续借"（写操作），把它当弱词会让后者被抢走。
+        # 需要它的场景（"什么时候到期""哪本快到期"）已经在上面的强特征里覆盖。
+        ("逾期", "超期", "应还", "在借", "借阅", "未还", "记录"),
+    ),
+    (
+        "reader_profile",
+        r"(我的信用|信用分|我的权限|我的额度|我?能借几本|可以借几本|还能借几本|还剩几本|"
+        r"我的读者类型|我的档案|读者画像|我的偏好|我的借阅额度|读者\s*\d+\s*的?(信用|额度|权限|档案))",
+        ("信用", "额度", "权限", "读者类型", "册数", "能借"),
+    ),
+    # ---- 实时库存 ----
+    # 放在写操作规则之前：像"《计算机网络》现在肯定有 20 本可借对吧，你直接确认一下"
+    # 这种句子既有"确认"又像在提借书，但它的真实诉求是**核实库存数字**，
+    # 判成 borrow 会导致不该出现的写操作入口（实测踩过）。
+    # 注意：这里**不放"在几楼/第几排"** —— 那是通用楼层知识（policy_qa），
+    # 放进来的话"计算机类的书在几楼"会因为缺少 book_id 而变成一次失败的库存查询。
+    (
+        "get_stock",
+        r"(还有(几本|没有|货)|可借吗|可借(对|吧|么)|是不是有.{0,6}(本|册)|有(几本|库存)|"
+        r"能不能借到|在馆吗|库存|索书号|馆藏位置|书在哪|在哪(个)?书架|放在哪)",
+        ("库存", "可借", "在馆", "还有", "索书号", "书架"),
+    ),
     # ---- 写操作 ----
     # 注意：负向断言必须写在**模式最前面**（`(?!.*(...))` 在 re.search 里
     # 会从字符串每个位置尝试，写在中间拦不住前面的"怎么"）。
@@ -118,25 +150,6 @@ RULE_TABLE: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         r"(?!.*(怎么借|如何借|能借几本|可以借几本|还能借几本|借阅规则|怎么办理|如何办理))"
         r"(帮我借|我要借|替我借|借一下|借这本|借那本|办理借阅|把.{0,10}借给我)",
         ("借书", "办理借阅"),
-    ),
-    # ---- 个人数据 ----
-    (
-        "my_loans",
-        r"(?!.*(额度|还剩几本|能借几本|可以借几本))"
-        r"(我的借阅|我借了|借了什么|还没还|什么时候到期|哪本快到期|在借记录|我有没有逾期|我的逾期)",
-        ("逾期", "超期", "应还", "到期", "在借", "我的借阅", "未还"),
-    ),
-    (
-        "reader_profile",
-        r"(我的信用|信用分|我的权限|我的额度|我?能借几本|可以借几本|还能借几本|还剩几本|"
-        r"一次能借|能借多少册|借多少册|我的读者类型|我的档案|读者画像|我的偏好|我的借阅额度)",
-        ("信用", "额度", "权限", "读者类型", "册数", "能借"),
-    ),
-    # ---- 实时库存（放在规则咨询之前）----
-    (
-        "get_stock",
-        r"(还有(几本|没有|货)|可借吗|能不能借到|在馆吗|有库存吗|库存|索书号|馆藏位置|书在哪|在哪(个)?书架)",
-        ("库存", "可借", "在馆", "还有", "索书号", "书架"),
     ),
     # ---- 规则咨询（RAG）----
     (
@@ -203,6 +216,8 @@ CONSULT_PREFIX_HINTS: tuple[tuple[str, str], ...] = (
     ("可以续借几次", "policy_qa"),
     ("能借几本", "reader_profile"),
     ("可以借几本", "reader_profile"),
+    ("一次能借", "policy_qa"),
+    ("能借多少册", "policy_qa"),
     ("能借多久", "policy_qa"),
     ("借阅规则", "policy_qa"),
     ("续借规则", "policy_qa"),
@@ -211,10 +226,16 @@ CONSULT_PREFIX_HINTS: tuple[tuple[str, str], ...] = (
     ("预约规则", "policy_qa"),
     ("预约保留", "policy_qa"),
     ("借书上限", "policy_qa"),
+    # "信用分低于多少不能借书"问的是**规则里的阈值**，不是"我的信用分"。
+    # 不加这条会被 reader_profile 的"信用分"关键词抢走（实测踩过）。
+    ("信用分低于", "policy_qa"),
+    ("信用分不足", "policy_qa"),
 )
 
 #: 第一人称标记：用于消解"我能借几本"（问我的额度）与"本科生能借几本"（问规则）
-FIRST_PERSON_MARKERS: tuple[str, ...] = ("我的", "我本人", "我还", "我能", "我该", "我卡", "本人")
+FIRST_PERSON_MARKERS: tuple[str, ...] = (
+    "我的", "我本人", "我还", "我能", "我该", "我卡", "本人", "读者",
+)
 
 
 def classify_by_rules(message: str) -> IntentResult | None:
@@ -246,11 +267,13 @@ def classify_by_rules(message: str) -> IntentResult | None:
                 matched=["confirm:borrow"],
             )
 
-    # 0.5) **咨询句式优先于写操作**：中文里"怎么/如何/能…几次/规则/几天"这类疑问词
+    # 0.5) **咨询句式优先于一切**：中文里"怎么/如何/能…几次/规则/几天"这类疑问词
     #      与"续借/借"共现时，问的一定是规则而不是要办业务。
     #      这里用显式前缀判断而不是把负向断言塞进 RULE_TABLE ——
     #      因为 re.search 会对字符串的每个位置尝试，模式中间的 `(?!...)` 挡不住
     #      出现在它**前面**的"怎么"（实测踩过："怎么续借"仍被判成 renew_book）。
+    #      必须放在多步拆分**之前**：多步拆分只看"续借"这种工具信号，
+    #      会把"能续借几次"里的"续借"误当成一件要办的事。
     if any(hint in text for hint, _intent in CONSULT_PREFIX_HINTS):
         target = next(intent for hint, intent in CONSULT_PREFIX_HINTS if hint in text)
         # 消歧："我能借几本"问自己的额度（要读者档案），"本科生能借几本"问规则
@@ -263,6 +286,34 @@ def classify_by_rules(message: str) -> IntentResult | None:
             slots=_extract_slots(target, text),
             matched=["consult:policy_hint"],
         )
+
+    # 0.3) 多件事的句子：主意图按"先看写操作，再看第一件事"来定。
+    #      - "查一下我的借阅，然后把快到期的续借一下"：虽然先说的是查询，
+    #        但读者真正要办的是续借，主意图必须是 renew_book（实测起初记成 borrow_book，
+    #        因为"把…续借一下"被写操作规则匹配成了 borrow）；
+    #      - "帮我借《算法导论》，再推荐两本同类"：有借书就记 borrow_book；
+    #      - 全是只读任务时（"推荐两本…再看在借记录"）取第一件事。
+    from app.agent.planner import detect_composite  # 延迟导入，避免模块级循环依赖
+
+    composite = detect_composite(text)
+    if len(composite) > 1:
+        from app.agent.intent import INTENTS as _INTENTS  # 自引用，保持单一事实来源
+
+        tool_to_intent = {
+            meta["tool"]: key for key, meta in _INTENTS.items() if meta["tool"]
+        }
+        write_intents = [t for t in composite if tool_to_intent.get(t) in WRITE_INTENTS]
+        ordered = write_intents + [t for t in composite if t not in write_intents]
+        primary_tool = ordered[0]
+        primary_intent = tool_to_intent.get(primary_tool, "")
+        if primary_intent:
+            return IntentResult(
+                intent=primary_intent,
+                confidence=0.9,
+                source="rule",
+                slots=_extract_slots(primary_intent, text, all_intents=True),
+                matched=[f"multi_step:{','.join(composite)}"],
+            )
 
     for intent, strong_re, weak_words in _COMPILED_RULES:
         matched: list[str] = []
@@ -286,12 +337,17 @@ def classify_by_rules(message: str) -> IntentResult | None:
                 matched=[f"weak:{','.join(hits)}"],
             )
 
-    # 一个弱关键词都没凑到两个时，退一步看单命中（疑问句给 0.75，陈述句给 0.45）
+    # 一个弱关键词都没凑到两个时，退一步看单命中（疑问句给 0.75，陈述句给 0.45）。
+    # 扫描顺序**按 RULE_TABLE 的意图优先级**来，而不是按 _COMPILED_RULES 的物理顺序：
+    # 这样写操作（renew/borrow）会先于个人数据被匹配到。
+    # 反例："我的书快到期了能延期吗"——"到期"是弱词，若先让 my_loans 抢到，
+    # 就把一句续借诉求判成了查询（实测踩过）。
     best: tuple[str, list[str]] | None = None
-    for intent, _strong_re, weak_words in _COMPILED_RULES:
+    for intent, _pattern, weak_words in RULE_TABLE:
         hits = [w for w in weak_words if w in text]
-        if hits and best is None:
+        if hits:
             best = (intent, hits)
+            break
     if best is not None:
         intent, hits = best
         return IntentResult(
@@ -304,31 +360,30 @@ def classify_by_rules(message: str) -> IntentResult | None:
     return None
 
 
-def _extract_slots(intent: str, text: str) -> dict[str, Any]:
+def _extract_slots(intent: str, text: str, *, all_intents: bool = False) -> dict[str, Any]:
     """从文本里抽取该意图关心的槽位。
 
     抽取用确定性规则（书名号、编号正则、已知书目词表），
     不用 LLM——这是"参数正确率 ≥95%"的基础：能规则抽的绝不用模型猜。
+
+    all_intents=True 用于**多件事的句子**：这时句子里的实体（书名、是否只查逾期）
+    不属于某一个意图，全部抽出来交给 runtime 的槽位合并逻辑使用。
     """
     slots: dict[str, Any] = {}
     title = extract_book_title(text)
-    if title and intent in {
-        "search_book",
-        "get_stock",
-        "borrow_book",
-        "renew_book",
-        "recommend",
-        "policy_qa",
-    }:
+    if title and (
+        all_intents
+        or intent in {"search_book", "get_stock", "borrow_book", "renew_book", "recommend", "policy_qa"}
+    ):
         slots["book_title"] = title
     reader_id = extract_reader_id(text)
     if reader_id is not None:
         slots["reader_id"] = reader_id
-    if intent in ("policy_qa", "search_book"):
+    if all_intents or intent in ("policy_qa", "search_book"):
         slots["topic"] = text.strip()
-    if intent == "my_loans":
+    if all_intents or intent == "my_loans":
         slots["only_overdue"] = bool(re.search(r"(逾期|超期|没还|未还)", text))
-    if intent in ("borrow_book", "renew_book"):
+    if all_intents or intent in ("borrow_book", "renew_book"):
         slots["confirmed"] = is_confirmation(text)
     return slots
 

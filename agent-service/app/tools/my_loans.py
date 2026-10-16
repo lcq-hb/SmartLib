@@ -85,11 +85,11 @@ class MyLoansTool(Tool):
             "bookId": item.get("bookId") or item.get("book_id"),
             "title": item.get("title") or "未知书名",
             "borrowAt": item.get("borrowAt") or item.get("borrow_at"),
-            "dueDate": item.get("dueDate") or item.get("due_at") or item.get("dueAt"),
+            "dueDate": item.get("dueDate") or item.get("dueAt") or item.get("due_at"),
             "renewCount": int(item.get("renewCount", item.get("renew_count", 0)) or 0),
             "renewable": bool(item.get("renewable", False)),
             "overdueDays": int(overdue_days),
-            "fine": item.get("fine"),
+            "fine": item.get("fine", item.get("fineAmount")),
             "status": item.get("status") or "",
         }
 

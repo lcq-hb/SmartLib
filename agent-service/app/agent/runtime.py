@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 import uuid
@@ -41,12 +42,18 @@ from app.agent.planner import Planner, is_composite
 from app.config import Settings, get_settings
 from app.errors import SmartLibError
 from app.llm.base import BaseLLM, ChatMessage, LLMResult
-from app.llm.mock import KNOWN_BOOKS, MockLLM
+from app.llm.mock import MockLLM
 from app.llm.router import LLMRouter
 from app.memory.reader_profile import get_profile_store
 from app.memory.session_store import Session, get_session_store
 from app.metrics import METRICS
 from app.tools import registry
+
+logger = logging.getLogger("smartlib.agent.runtime")
+
+#: 对外响应结构版本。前端/后端契约若有破坏性变更就 +1，
+#: 并把变更写进 README 的"变更记录"，避免联调时两边对不上。
+SCHEMA_VERSION = "1.1.0"
 from app.tools.base import ToolContext, ToolResult
 
 
@@ -79,6 +86,10 @@ class AgentResult:
     #: 本次回复由护栏直接给出（拒绝/转人工）。置位后输出护栏不再改写它，
     #: 否则"越权拒绝"会被"无证据不下结论"覆盖成一句无关的兜底话术。
     guardrail_blocked: bool = False
+    #: 已经"决定要调用、但因为需要二次确认而暂时没执行"的工具。
+    #: 单独记录是为了让观测端能分清"模型没想到要调这个工具"和
+    #: "模型想调、被安全策略正确地拦在确认这一步"——这两者在评测里含义完全不同。
+    pending_tools: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -101,6 +112,7 @@ class AgentResult:
             "degraded": self.degraded,
             "plan": self.plan,
             "pending_confirm": self.pending_confirm,
+            "pending_tools": self.pending_tools,
         }
 
 
@@ -268,8 +280,12 @@ class AgentRuntime:
         else:
             await self._run_stepwise(message, slots, session, adapter, executor, result, agent_mode)
 
-        result.tool_calls = [t.model_dump() for t in executor.traces]
-        result.steps = max(executor.steps, len(result.tool_calls))
+        # 对外只暴露读者问的那次调用；运行时内部补的步骤（如为解析 book_id 而补的
+        # 检索）单独放在 internal_tool_calls，避免前端把过程展示成
+        # 我问库存，它怎么去检索了的困惑。
+        result.tool_calls = [t.model_dump() for t in executor.traces if not t.internal]
+        result.internal_tool_calls = [t.model_dump() for t in executor.traces if t.internal]
+        result.steps = max(executor.steps, len(executor.traces))
         result.tool_evidence = executor.has_evidence()
         result.degraded = result.degraded or (adapter.last_error is not None)
 
@@ -337,8 +353,15 @@ class AgentRuntime:
                     tc = llm_result.tool_calls[0]
                     if tc.name in registry.names() and tc.name not in executed:
                         merged = self._default_args(tc.name, slots, confirmed=self._is_confirming(message, session))
-                        # LLM 给的参数优先，缺失的用确定性参数补齐
-                        merged.update({k: v for k, v in tc.arguments.items() if v is not None})
+                        # LLM 给的参数优先，缺失的用确定性参数补齐 ——
+                        # **但书目 id 例外**：它必须来自工具结果，模型给的一律丢弃。
+                        model_args = {k: v for k, v in tc.arguments.items() if v is not None}
+                        for key in ("book_id", "bookId"):
+                            claimed = model_args.pop(key, None)
+                            if claimed is not None and key not in merged:
+                                # 模型编了一个我们无法背书的 id：记一笔，不带它去调后端
+                                self._report_unsourced_block(slots, tc.name, claimed, result)
+                        merged.update(model_args)
                         call = (tc.name, merged)
                 elif llm_result is not None and llm_result.content:
                     result.reply = llm_result.content
@@ -348,11 +371,41 @@ class AgentRuntime:
                 break
 
             name, args = call
+
+            # 前置核验：保证 get_stock / borrow 的 book_id 有工具来源，
+            # 并在借书前确认"这本书现在有可借复本"。
+            # 与 plan 路径共用同一个 helper，避免两条路径行为不一致（实测踩过）。
+            had_search = self._search_items(slots)
+            had_evidence = self._write_evidence_checked(slots)
+            args = await self._ensure_book_evidence(name, args, slots, executor, observations)
+            if self._search_items(slots) and not had_search:
+                result.guardrail_notes.append("G-13_book_id_sourcing:prerequisite_search")
+            if self._write_evidence_checked(slots) and not had_evidence:
+                result.guardrail_notes.append("G-13_write_evidence:prerequisite_stock")
+
+            # 关键参数仍然缺失（书名检索不到 → 拿不到可信 book_id）：
+            # **必须在这里就给读者一句人话**，不能交给护栏的 G-02 ——
+            # G-02 会输出"book_id"这种内部字段名，读者根本不知道那是什么
+            # （实测读者看到的是"我还需要一些信息才能办理：book_id"）。
+            if not self._required_args_satisfied(name, args):
+                question = (
+                    self._no_book_found_question(slots)
+                    if name in self.BOOK_SCOPED_TOOLS
+                    else self._clarify_question(name, args)
+                )
+                result.reply = question
+                result.guardrail_blocked = True
+                executed.add(name)
+                break
+
             decision = self.guardrail.check_tool_call(
                 name,
                 args,
                 session_reader_id=slots.get("reader_id"),
                 confirmed=self._guardrail_confirmed(name, args, session),
+                # 写操作必须带上"是否已拿到馆藏证据"的真实状态，
+                # 否则护栏会把一个必然失败的写操作当成待确认抛给读者（G-13）
+                evidence_checked=self._write_evidence_checked(slots),
             )
             result.guardrail_notes.extend(decision.notes)
 
@@ -361,6 +414,8 @@ class AgentRuntime:
                     # 只有"缺确认"才排队 pending；越权/无关等 refuse 绝不能进 pending 队列
                     session.set_pending(name, args)
                     result.pending_confirm = {"tool": name, "args": args}
+                    if name not in result.pending_tools:
+                        result.pending_tools.append(name)
                     result.reply = decision.verdict.message
                 else:
                     # 越权等直接拒绝：标记为"护栏已给出权威话术"，
@@ -388,7 +443,18 @@ class AgentRuntime:
                 break
 
         if not result.reply:
-            result.reply = await self._render_answer(message, slots, observations, adapter, result)
+            # 只渲染"读者真正问的那个工具"的结果：
+            # 前置核验用的 search_books 是内部步骤，把它一起渲染出来会让回答
+            # 变成"先列一遍检索结果再说库存"，读者问的只是库存（实测体验很吵）。
+            # 但当前工具失败时例外 —— 那时检索结果就是"为什么没答出来"的证据。
+            # 用**当前这一步的工具名**挑要渲染的观察结果：内部前置步骤（search/get_stock）
+            # 不该出现在回答里，否则读者问还有几本会先看到一屏检索结果。
+            primary = [obs for obs in observations if obs.tool == name] or observations
+            if primary and not primary[-1].ok:
+                # 当前工具失败时，把前置检索结果一并交给渲染器 ——
+                # 那时它正是为什么没答出来的证据。
+                primary = observations
+            result.reply = await self._render_answer(message, slots, primary, adapter, result)
 
         # 规则问答的出处要单独回传（前端展示"来源"）
         self._collect_rag_sources(result, observations)
@@ -414,6 +480,12 @@ class AgentRuntime:
 
         observations: list[ToolResult] = []
         failed: list[str] = []
+        #: 写操作被拒（越权/需要确认）后，**只读步骤仍然要跑**：
+        #: 读者问"续借读者 2002 的图书"，我们虽然拒绝代办，但没有任何理由
+        #: 连"您自己的在借记录"都不给查（实测踩过：直接 break 会让整轮对话只剩一句拒绝）。
+        write_blocked = False
+        #: 需要向读者追问的问题（关键参数缺失时产生）
+        pending_clarify = ""
 
         for _ in range(self.settings.max_steps):
             step = plan.next_pending()
@@ -424,14 +496,54 @@ class AgentRuntime:
                 plan.mark(step, "skipped", "工具不在白名单")
                 continue
 
-            args = self._default_args(name, slots, confirmed=self._is_confirming(message, session))
+            # 每个步骤都用**基础槽位的副本**构造参数。
+            # 对"与具体书目无关"的工具（续借、查在借、查档案、推荐）先清掉
+            # book_title/book_id：那些字段是上一步为了别的目的抽出来的，
+            # 继承过来会变成错误的入参（实测：renew 被传了一个不相干的书目）。
+            # renew 依赖的是 loans（borrowId 映射），所以 loans 必须保留。
+            step_slots = dict(slots)
+            if name in ("renew", "my_loans", "get_reader_profile", "recommend"):
+                step_slots.pop("book_title", None)
+                step_slots.pop("book_id", None)
+            args = self._default_args(name, step_slots, confirmed=self._is_confirming(message, session))
             args.update({k: v for k, v in (step.args or {}).items() if v is not None})
+
+            # 前置核验：保证 book_id 有工具来源，且借书前确认有可借复本。
+            # 与单步路径共用同一 helper，两条路径行为必须一致。
+            had_search = self._search_items(slots)
+            had_evidence = self._write_evidence_checked(slots)
+            args = await self._ensure_book_evidence(name, args, slots, executor, observations)
+            if self._search_items(slots) and not had_search:
+                result.guardrail_notes.append("G-13_book_id_sourcing:prerequisite_search")
+            if self._write_evidence_checked(slots) and not had_evidence:
+                result.guardrail_notes.append("G-13_write_evidence:prerequisite_stock")
+
+            # 关键参数缺失（例如"把快到期的续借一下"没说是哪一本，拿不到 borrowId；
+            # 或书名检索不到、拿不到任何可信 book_id）：**该追问读者**，不是报错。
+            # 必须在护栏的参数校验之前处理：护栏的 G-02 会输出"book_id"这种内部
+            # 字段名，读者根本不知道那是什么（实测读者看到的是"我还需要一些信息
+            # 才能办理：book_id"）。
+            if not self._required_args_satisfied(name, args):
+                question = (
+                    self._no_book_found_question(slots)
+                    if name in self.BOOK_SCOPED_TOOLS
+                    else self._clarify_question(name, args)
+                )
+                plan.mark(step, "failed", question)
+                failed.append(name)
+                pending_clarify = question
+                if not result.reply:
+                    result.reply = question
+                continue
 
             decision = self.guardrail.check_tool_call(
                 name,
                 args,
                 session_reader_id=slots.get("reader_id"),
                 confirmed=self._guardrail_confirmed(name, args, session),
+                # 写操作必须带上"是否已拿到馆藏证据"的真实状态，
+                # 否则护栏会把一个必然失败的写操作当成待确认抛给读者（G-13）
+                evidence_checked=self._write_evidence_checked(slots),
             )
             result.guardrail_notes.extend(decision.notes)
             if decision.action in ("ask", "refuse", "handoff"):
@@ -439,14 +551,20 @@ class AgentRuntime:
                     # 写操作卡在确认上：把这一步留成 pending，其余步骤先做完
                     session.set_pending(name, args)
                     result.pending_confirm = {"tool": name, "args": args}
+                    if name not in result.pending_tools:
+                        result.pending_tools.append(name)
                     plan.mark(step, "skipped", "等待用户确认")
-                else:
-                    plan.mark(step, "failed", decision.verdict.message)
-                    failed.append(name)
-                    if not step.optional:
-                        result.reply = decision.verdict.message
-                        result.guardrail_blocked = True
-                        break
+                    continue
+                plan.mark(step, "failed", decision.verdict.message)
+                failed.append(name)
+                if not step.optional:
+                    result.reply = decision.verdict.message
+                    result.guardrail_blocked = True
+                    if registry.get(name) and registry.get(name).is_write:
+                        # 写操作被拒：记住这件事，但继续执行后面的只读步骤
+                        write_blocked = True
+                        continue
+                    break
                 continue
 
             tool_result = await executor.execute(name, args)
@@ -465,14 +583,23 @@ class AgentRuntime:
         result.degraded = result.degraded or bool(failed)
         self._collect_rag_sources(result, observations)
 
-        if not result.reply:
-            if observations:
-                result.reply = await self._render_answer(message, slots, observations, adapter, result)
+        # 有实际观察结果时，用它们生成回答（即使中途有写操作被拒，
+        # 也要把已经查到的信息给读者，而不是只留一句拒绝）
+        if observations:
+            rendered = await self._render_answer(message, slots, observations, adapter, result)
+            if result.guardrail_blocked or pending_clarify:
+                # 护栏话术/追问在前，补充性信息在后，避免重点被淹没在数据里
+                result.reply = f"{result.reply}\n\n{rendered}" if result.reply else rendered
             else:
-                result.reply = prompts.FALLBACK_MESSAGES["no_evidence"]
+                result.reply = rendered
+        elif not result.reply:
+            result.reply = prompts.FALLBACK_MESSAGES["no_evidence"]
 
         # 本轮有写操作卡在二次确认上：必须在回复里明确说明"等你确认"，
         # 否则读者只看到"库存可借 3 册"会以为已经借好了（这是实测踩过的坑）。
+        if write_blocked and result.pending_confirm is None and "确认" not in result.reply:
+            result.reply += "\n\n（这项操作我没有权限代办，如需为您本人办理请告诉我。）"
+
         if result.pending_confirm and "确认" not in result.reply:
             tool_name = result.pending_confirm.get("tool")
             if tool_name == "borrow":
@@ -633,7 +760,8 @@ class AgentRuntime:
             return result
 
         tool_result = await executor.execute(pending.tool, args)
-        result.tool_calls = [t.model_dump() for t in executor.traces]
+        result.tool_calls = [t.model_dump() for t in executor.traces if not t.internal]
+        result.internal_tool_calls = [t.model_dump() for t in executor.traces if t.internal]
         result.steps = executor.steps
         result.tool_evidence = executor.has_evidence()
         result.reply = tool_result.summary or tool_result.error_message or ""
@@ -675,6 +803,13 @@ class AgentRuntime:
         if claimed is not None:
             slots["claimed_reader_id"] = claimed
         slots.update(extracted)
+        # 用户**在消息里明确说出的**书名单独记一份（user_book_title）。
+        # 理由：多步执行时每一步要用"与该步相关"的槽位，book_title 会被后续步骤清掉
+        # 以避免继承无关实体；但"续借《计算机网络》"这种场景又必须用这个书名
+        # 去借阅记录里定位 borrowId。区分"用户明说"与"上一步继承"两个来源，
+        # 才能既避免串味、又保住必要的指代（实测踩过两种失败模式）。
+        if extracted.get("book_title"):
+            slots["user_book_title"] = extracted["book_title"]
         slots["_message"] = message
         return slots
 
@@ -683,17 +818,26 @@ class AgentRuntime:
     ) -> dict[str, Any]:
         """为工具生成确定性参数。
 
-        为什么需要这一层：LLM（尤其 Mock）不一定会把 readerId 填对，
-        而 readerId 属于"系统已知的会话事实"，就不该让模型猜。
-        这里先用会话事实兜住必需字段，LLM 只需补充它真正知道的业务参数。
+        两条原则：
+        1. **系统已知的事实不让模型猜**：`readerId` 来自会话，`bookId` 来自工具结果；
+        2. **写操作的 confirm 只有在"已完成前置核验"时才置位**（见
+           `_write_evidence_checked`），否则必然是"确认了也失败"的空确认。
         """
         reader_id = slots.get("reader_id")
         # 读者在话里明确点名了别的编号时，把**claimed**传给工具/护栏，
-        # 这样越权检查才有东西可比对（用会话身份去填，检查会永远通过——等于没检查）。
+        # 这样越权检查才有机会比对（用会话身份去填，检查会永远通过——等于没检查）。
         claimed_reader = slots.get("claimed_reader_id")
         effective_reader = claimed_reader if claimed_reader is not None else reader_id
         title = slots.get("book_title") or ""
-        book_id = slots.get("book_id") or KNOWN_BOOKS.get(title)
+        # ⚠️ 绝不在这里回退到"书名→id 的本地映射表"。
+        # 那张表只是离线假后端的数据，真实后端里 id 完全不同，回退会让
+        # get_stock/borrow 拿着不存在的 id 去打后端（实测 404：图书不存在：id=102）。
+        book_id = self._resolve_book_id(slots, title)
+        # 记录"读者本轮是否表达了确认意图"。前置核验（补检索/查库存）会重新构造参数，
+        # 那时必须能重新读到这个意图 —— 否则"确认借阅"这句话会在重建参数时丢掉，
+        # 变成又一次"请回复确认"（实测踩过：读者已经说了确认，系统还在问确认）。
+        slots["_confirm_intent"] = bool(confirmed)
+        write_confirm = bool(confirmed) and bool(slots.get("_write_evidence_checked"))
         args: dict[str, Any] = {}
         message = slots.get("_message") or ""
 
@@ -705,18 +849,23 @@ class AgentRuntime:
             args = {
                 "readerId": effective_reader,
                 "bookId": book_id,
-                # 幂等键必须**稳定**：同一会话 + 同一读者 + 同一本书 → 同一个 key。
+                # 幂等键必须**稳定**：同一读者 + 同一本书 → 同一个 key。
                 # 后端靠它保证"网络重试/用户重复点确认"不会借两次。
                 "idempotencyKey": f"ag-borrow-{effective_reader}-{book_id}",
-                "confirm": confirmed,
+                "confirm": write_confirm,
             }
         elif tool_name == "renew":
-            borrow_id = slots.get("borrow_id") or self._pick_borrow_id(slots, title)
+            # 用"用户明说的书名"在借阅记录里定位 borrowId；
+            # 用户没说书名时退回单一记录自动选择（多本时向读者追问，不瞎猜）
+            borrow_id = (
+                slots.get("borrow_id")
+                or self._pick_borrow_id(slots, slots.get("user_book_title") or title)
+            )
             args = {
                 "readerId": effective_reader,
                 "borrowId": borrow_id,
                 "idempotencyKey": f"ag-renew-{effective_reader}-{borrow_id}",
-                "confirm": confirmed,
+                "confirm": write_confirm,
             }
         elif tool_name == "my_loans":
             args = {"readerId": effective_reader, "only_overdue": bool(slots.get("only_overdue"))}
@@ -729,6 +878,289 @@ class AgentRuntime:
             if book_id:
                 args["book_id"] = book_id
         return {k: v for k, v in args.items() if v is not None}
+
+    # ---------------- book_id 溯源（反幻觉硬约束）----------------
+    #: 中文序数词 → 序号，用于"第 N 本"这类指代
+    _ORDINALS: dict[str, int] = {
+        "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+        "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+    }
+
+    def _search_items(self, slots: dict[str, Any]) -> list[dict[str, Any]]:
+        """取出工具返回过的书目列表（唯一可信的书目 id 来源）。"""
+        items = slots.get("search_items")
+        if isinstance(items, list):
+            return [item for item in items if isinstance(item, dict)]
+        return []
+
+    def _resolve_book_id(self, slots: dict[str, Any], title: str = "") -> int | None:
+        """**唯一允许产出 book_id 的入口**：只从工具返回的书目列表里取。
+
+        为什么不先用模型给的 id：
+        模型（无论 Mock 还是真实 LLM）完全可能编一个 id —— 实测中 Mock 用了
+        离线假后端的 id（101/102），打到真实后端直接 `图书不存在：id=102`。
+        这是一类**必然发生**的缺陷，而"事实只能来自工具"正是要在这里落地：
+        没有工具结果背书，就不给它 id，让流程去补一次检索，或者如实说没找到。
+
+        支持三种指代：
+        - 显式书名（《算法导论》，允许"书名包含/被包含"的模糊对应，如"（第3版）"）
+        - 序数（"第 2 本""第二个"）→ 映射到检索结果的对应位置
+        - 无书名但结果唯一 → 直接采用（此时不存在歧义）
+        """
+        items = self._search_items(slots)
+        # 已经由**更权威的来源**（get_stock 的实时库存应答）确认过的 id 直接用。
+        # 为什么必须保留它：库存接口回显的 bookId 就是"这本书在后端的真实主键"，
+        # 而 search_items 只是上一步为了别的目的留下的候选列表。
+        # 丢掉它会退化成"拿书名重新匹配候选"，多步流程里极易匹配到别的书（实测踩过）。
+        if slots.get("_book_id_source") == "get_stock" and slots.get("book_id"):
+            return int(slots["book_id"])
+        if not items:
+            return int(slots["book_id"]) if slots.get("book_id") else None
+
+        message = slots.get("_message") or ""
+        has_ordinal = self._ordinal_index(message) is not None
+
+        # 序数指代（"第 2 本"）要**优先**解析：用户的"第 N 本"是相对**检索结果列表**
+        # 说的，此时若还按书名匹配，会忽略序数直接选到同名的第一条（实测踩过）。
+        if has_ordinal:
+            ordinal = self._ordinal_index(message)
+            if ordinal is not None and 1 <= ordinal <= len(items):
+                return self._int_id(items[ordinal - 1])
+            return None
+
+        if title:
+            for item in items:
+                item_title = str(item.get("title") or "")
+                if not item_title:
+                    continue
+                if title == item_title or title in item_title or item_title in title:
+                    return self._int_id(item)
+            # 书名对不上任何一条检索结果 → 视为没找到（绝不猜）
+            return None
+
+        if len(items) == 1:
+            return self._int_id(items[0])
+        return None
+
+    @staticmethod
+    def _int_id(item: dict[str, Any]) -> int | None:
+        value = item.get("bookId")
+        if value is None:
+            value = item.get("book_id") or item.get("id")
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _ordinal_index(cls, message: str) -> int | None:
+        """把"第 2 本 / 第二个 / 第3本"解析成序号；解析不出返回 None。"""
+        import re
+
+        match = re.search(r"第\s*([0-9]{1,2}|[一二两三四五六七八九十])\s*(本|个|条)", message)
+        if not match:
+            return None
+        token = match.group(1)
+        if token.isdigit():
+            return int(token)
+        return cls._ORDINALS.get(token)
+
+    def _report_unsourced_block(
+        self,
+        slots: dict[str, Any],
+        action: str,
+        claimed: Any,
+        result: AgentResult | None = None,
+    ) -> None:
+        """记录一次"丢弃未经工具验证的 book_id"。
+
+        这条既进指标（`/admin/metrics` 的 `unsourced_book_id_blocked`）也进 trace，
+        便于回答"到底有多少次是模型在编 id"这种问题。
+        """
+        METRICS.incr("unsourced_book_id_blocked")
+        detail = f"已丢弃未经工具验证的书目 id：{claimed}（动作 {action}，待检索结果背书）"
+        if result is not None:
+            result.guardrail_notes.append(f"G-13_book_id_sourcing:{action}")
+            result.degraded = result.degraded or True
+        logger.warning("unsourced book_id blocked: action=%s claimed=%r message=%r",
+                       action, claimed, slots.get("_message"))
+
+    #: 需要"书目 id"才能执行的工具。执行前必须先由 search_books 拿到真实 id。
+    BOOK_SCOPED_TOOLS: frozenset[str] = frozenset({"get_stock", "borrow"})
+
+    #: 需要对"书目证据"的工具：get_stock 要 id 才能查，borrow 必须先确认有可借复本。
+    #: renew 不在此列——它按借阅记录（borrowId）办理，由 loans 提供凭据。
+    BOOK_SCOPED_TOOLS: frozenset[str] = frozenset({"get_stock", "borrow"})
+
+    async def _ensure_book_evidence(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        slots: dict[str, Any],
+        executor: ToolExecutor,
+        observations: list[ToolResult],
+    ) -> dict[str, Any]:
+        """在执行 `get_stock` / `borrow` 之前，保证 book_id 有工具来源。
+
+        做两件事，顺序固定：
+        1. 若还没有可信 id → 内部补一次 search_books（`internal=True`）；
+        2. 若是借书 → 再补一次 get_stock，确认"这本书现在有可借复本"。
+           没有这一步，我们就会在书已借空的情况下问读者"要不要借"，
+           读者确认后必然失败（实测踩过 404 与 NO_AVAILABLE_COPY 两种情况）。
+
+        返回可能被刷新过的 args（book_id 来源变了要重新构造参数）。
+        """
+        if tool_name not in self.BOOK_SCOPED_TOOLS:
+            return args
+
+        refreshed = args
+        if self._needs_prerequisite_search(tool_name, refreshed, slots):
+            search_step = self._search_step(slots)
+            search_result = await executor.execute(
+                search_step.tool, search_step.args, internal=True
+            )
+            observations.append(search_result)
+            self._absorb_slots(slots, search_step.tool, search_result)
+            refreshed = self._default_args(
+                tool_name, slots, confirmed=bool(slots.get("_confirm_intent"))
+            )
+
+        # 借书前必须确认**实时**可借复本（get_stock 自己不需要再查一次）。
+        # 为什么不复用 search 结果里的 availableCopies：那是检索侧的展示值，
+        # 可能有缓存延迟；库存是高频写数据，借阅决策必须看权威值。
+        # 这里刻意**不判断** `_write_evidence_checked`：只要决定要借就查一次，
+        # 让"每次借书都经过库存核验"这条不变式简单且可验证。
+        if tool_name == "borrow":
+            book_id = refreshed.get("bookId")
+            if book_id:
+                stock_result = await executor.execute(
+                    "get_stock", {"book_id": book_id}, internal=True
+                )
+                observations.append(stock_result)
+                self._absorb_slots(slots, "get_stock", stock_result)
+                refreshed = self._default_args(
+                    tool_name, slots, confirmed=bool(slots.get("_confirm_intent"))
+                )
+        return refreshed
+
+    def _needs_prerequisite_search(
+        self, tool_name: str, args: dict[str, Any], slots: dict[str, Any]
+    ) -> bool:
+        """执行前判断：是否必须先补一次检索才能拿到可信的 book_id。
+
+        触发条件：目标是书目相关工具 + 参数里没有 book_id + 槽位里也没有可用的
+        已检索结果。此时**不能**凭模型给的 id 或本地映射表硬打后端，
+        而是先让 search_books 去后端问一次（"没有工具证据就不下结论"的落地）。
+        """
+        if tool_name not in self.BOOK_SCOPED_TOOLS:
+            return False
+        if args.get("book_id") or args.get("bookId"):
+            return False
+        return not self._search_items(slots)
+
+    def _search_step(self, slots: dict[str, Any]) -> Step:
+        """构造"为了拿到真实 book_id 而补的检索步骤"。"""
+        title = slots.get("book_title") or ""
+        message = (slots.get("_message") or "").strip()
+        return Step(
+            index=0,
+            tool="search_books",
+            description="先检索确认书目，拿到真实 bookId",
+            args={"query": title or message[:40] or "图书", "page": 1, "size": 5, "sortBy": "relevance"},
+        )
+
+    @staticmethod
+    def _write_evidence_checked(slots: dict[str, Any]) -> bool:
+        """写操作是否已具备"可执行"的前置证据。
+
+        两类证据任一即可：
+        - **书目证据**：search_books 命中候选，或 get_stock 查到了馆藏 → 可以借；
+        - **借阅记录证据**：my_loans 返回了借阅记录 → 可以续（记录本身就是凭据，
+          续借不需要 book_id，此时再要求"先查库存"是无意义的加码）。
+
+        为什么必须有这条：如果书本身不存在/没有可借复本，还把
+        "要我现在就为您办理借阅吗？"抛给读者，读者确认之后必然失败
+        —— 实测就是"404 之后仍然追问确认借阅"，这是对读者最不负责的一种交互。
+        """
+        if slots.get("_write_evidence_checked"):
+            return True
+        return bool(slots.get("loans"))
+
+    #: 需要"书目 id"才能执行的工具。执行前必须先由 search_books 拿到真实 id。
+    BOOK_SCOPED_TOOLS: frozenset[str] = frozenset({"get_stock", "borrow"})
+
+    def _needs_prerequisite_search(
+        self, tool_name: str, args: dict[str, Any], slots: dict[str, Any]
+    ) -> bool:
+        """执行前判断：是否必须先补一次检索才能拿到可信的 book_id。
+
+        触发条件：目标是书目相关工具 + 参数里没有 book_id + 槽位里也没有可用的
+        已检索结果。此时**不能**凭模型给的 id 或本地映射表硬打后端，
+        而是先让 search_books 去后端问一次（"没有工具证据就不下结论"的落地）。
+        """
+        if tool_name not in self.BOOK_SCOPED_TOOLS:
+            return False
+        if args.get("book_id") or args.get("bookId"):
+            return False
+        return not self._search_items(slots)
+
+    def _search_step(self, slots: dict[str, Any]) -> Step:
+        """构造"为了拿到真实 book_id 而补的检索步骤"。"""
+        title = slots.get("book_title") or ""
+        message = (slots.get("_message") or "").strip()
+        return Step(
+            index=0,
+            tool="search_books",
+            description="先检索确认书目，拿到真实 bookId",
+            args={
+                "query": title or message[:40] or "图书",
+                "page": 1,
+                "size": 5,
+                "sortBy": "relevance",
+            },
+        )
+
+    @staticmethod
+    def _no_book_found_question(slots: dict[str, Any]) -> str:
+        """检索不到任何书目时的如实回答——宁可说没找到，也不带着猜的 id 去调后端。"""
+        title = slots.get("book_title") or slots.get("user_book_title") or ""
+        if title:
+            return (
+                f"我在馆藏里没有找到《{title}》这本书，所以没法确认它的库存或办理借阅。"
+                "麻烦您核对一下书名或提供 ISBN，我再帮您查。"
+            )
+        return (
+            "我没有在馆藏里找到匹配的书，麻烦您告诉我准确的书名或 ISBN，我再帮您查。"
+        )
+
+    @staticmethod
+    def _required_args_satisfied(tool_name: str, args: dict[str, Any]) -> bool:
+        required = {
+            "borrow": ("readerId", "bookId"),
+            "renew": ("readerId", "borrowId"),
+            "my_loans": ("readerId",),
+            "get_reader_profile": ("readerId",),
+            "get_stock": ("book_id",),
+            "search_books": ("query",),
+            "policy_qa": ("topic",),
+        }.get(tool_name, ())
+        return all(args.get(key) not in (None, "") for key in required)
+
+    @staticmethod
+    def _clarify_question(tool_name: str, args: dict[str, Any]) -> str:
+        """把"缺参数"翻译成读者能回答的追问（不暴露 borrowId 这类内部字段名）。"""
+        if tool_name == "renew" and args.get("borrowId") in (None, ""):
+            return (
+                "您想续借哪一本？您当前有多本在借图书，麻烦告诉我书名"
+                "（例如“续借《计算机网络》”），我再帮您办理。"
+            )
+        if tool_name == "borrow" and args.get("bookId") in (None, ""):
+            return "您想借哪一本书？告诉我书名或 ISBN，我先帮您确认是否可借。"
+        if tool_name == "get_stock":
+            return "您想查哪一本书的库存？告诉我书名，我来查它还有几册可借、在哪个位置。"
+        if tool_name in ("my_loans", "get_reader_profile") and args.get("readerId") in (None, ""):
+            return "请先告诉我您的读者编号（例如 readerId=1001），我才能查您的借阅信息。"
+        return "我还需要一些信息才能办理这件事，麻烦您补充一下书名或读者编号。"
 
     @staticmethod
     def _pick_borrow_id(slots: dict[str, Any], title: str) -> int | None:
@@ -756,27 +1188,39 @@ class AgentRuntime:
         return bool(args.get("confirm"))
 
     def _absorb_slots(self, slots: dict[str, Any], tool_name: str, result: ToolResult) -> None:
-        """把工具返回的实体累积进槽位，供后续步骤复用（跨步指代的关键）。"""
+        """把工具返回的实体累积进槽位，供后续步骤复用（跨步指代的关键）。
+
+        同时维护 `_write_evidence_checked`：只有**真正拿到过书目信息**（检索到候选，
+        或库存查询成功）才置位。写操作的 confirm 与"待确认"都以它为前提，
+        避免出现"书都不存在还追问要不要借"的空确认（实测踩过）。
+        """
         if not result.ok or not isinstance(result.data, dict):
-            if tool_name == "my_loans" and result.ok and isinstance(result.data, dict):
-                slots["loans"] = result.data.get("items")
             return
         data = result.data
         if tool_name == "search_books":
-            items = data.get("items") or []
+            items = [item for item in (data.get("items") or []) if isinstance(item, dict)]
             slots["search_items"] = items
-            title = slots.get("book_title")
-            if title:
-                for item in items:
-                    if isinstance(item, dict) and title in str(item.get("title") or ""):
-                        slots["book_id"] = item.get("bookId")
-                        break
-            elif items and isinstance(items[0], dict):
-                slots["book_id"] = items[0].get("bookId")
-                slots["book_title"] = items[0].get("title")
+            # 已经被库存应答确认过 book_id 时不再重新解析，避免被旧候选覆盖
+            if slots.get("_book_id_source") == "get_stock" and slots.get("book_id"):
+                return
+            title = slots.get("book_title") or slots.get("user_book_title")
+            # book_id **只能**来自这里（工具返回的真实 id），不接受模型传进来的值
+            resolved = self._resolve_book_id(slots, title or "")
+            if resolved is not None:
+                slots["book_id"] = resolved
+                slots["_book_id_source"] = "search_books"
+                slots["_write_evidence_checked"] = True
         elif tool_name == "get_stock":
-            slots["book_id"] = data.get("bookId") or slots.get("book_id")
-            slots["book_title"] = data.get("title") or slots.get("book_title")
+            # 库存查询成功也说明"这本书真实存在且有权威信息"
+            if data.get("bookId") is not None:
+                slots["book_id"] = data.get("bookId")
+                slots["_book_id_source"] = "get_stock"
+            # ⚠️ **不要**用库存返回的 title 覆盖 book_title：
+            # book_title 是"读者问的那本书"，是后续步骤做书名→id 解析的依据。
+            # 一旦被覆盖成上一本书的标题，多步流程里后面的 borrow/renew 会拿着
+            # 错误的书名去解析（实测："帮我借《机器学习》，再查信用分"里的借阅
+            # 被解析成了算法导论）。书名只允许在 search_books 命中时补全。
+            slots["_write_evidence_checked"] = True
         elif tool_name == "my_loans":
             slots["loans"] = data.get("items") or []
         elif tool_name == "borrow":
@@ -878,7 +1322,11 @@ class AgentRuntime:
             first_token = result.latency_ms
         result.first_token_ms = first_token
 
-        yield {"type": "done", "result": result.to_dict()}
+        yield {
+            "type": "done",
+            "result": result.to_dict(),
+            "schema_version": SCHEMA_VERSION,
+        }
 
 
 __all__ = ["AgentRuntime", "AgentResult"]

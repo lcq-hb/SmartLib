@@ -74,6 +74,8 @@ class GetStockTool(Tool):
             )
         raw_available = data.get("available", data.get("availableCopies"))
         available = int(raw_available if raw_available is not None else 0)
+        # 真实后端 stock 返回的是 totalCopies / availableCopies（联调实测），
+        # 蓝图 §8.2 写的是 total / available；两种字段名都兼容。
         total = data.get("total", data.get("totalCopies"))
         return {
             "bookId": data.get("bookId") or data.get("book_id") or book_id,

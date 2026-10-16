@@ -256,7 +256,7 @@ def parse_sse(raw: str) -> list[dict]:
 @pytest.mark.asyncio
 async def test_recommend_endpoint(api) -> None:
     client, _app, _backend = api
-    resp = await client.post("/recommend", json={"book_id": 101, "limit": 2})
+    resp = await client.post("/recommend", json={"book_id": 5, "limit": 2})
     assert resp.status_code == 200
     body = resp.json()
     assert body["trace_id"]

@@ -218,8 +218,15 @@ class Guardrail:
         *,
         session_reader_id: int | None,
         confirmed: bool,
+        evidence_checked: bool = True,
     ) -> GuardrailDecision:
-        """工具调用前的检查。confirmed 表示本次会话是否已有用户的明确确认。"""
+        """工具调用前的检查。
+
+        - `confirmed`：本次会话是否已有用户的明确确认；
+        - `evidence_checked`：写操作是否**已经拿到过**"这本书存在且有馆藏信息"的
+          工具证据。默认 True 是为了不破坏只读工具的调用方；
+          写操作必须由 runtime 显式传入真实状态（见 G-13）。
+        """
         notes: list[str] = []
         verdict = Verdict("allow", "")
 
@@ -252,6 +259,9 @@ class Guardrail:
             )
 
         # G-03 禁止替他人借书（写操作 + 个人数据类工具都必须绑定当前会话读者）
+        # 判定顺序：**越权 > 缺前置证据 > 缺确认**。
+        # 顺序是刻意排的：越权必须拒绝；而"书查不到/借不到"时也绝不能
+        # 抛出"请回复确认"——读者确认了也必然失败（实测：404 之后仍追问确认借阅）。
         if tool.requires_reader:
             claimed = args.get("readerId") if isinstance(args, dict) else None
             if session_reader_id is None:
@@ -277,6 +287,20 @@ class Guardrail:
                     ),
                     notes=["G-03_no_borrow_for_others:refuse"],
                 )
+
+        # G-13 写操作必须有前置核验：拿不到"这本书存在且有可借复本"的证据时，
+        # 不允许把它当成"待确认"抛给读者（否则读者确认之后必然失败）。
+        if tool.is_write and not evidence_checked:
+            return GuardrailDecision(
+                Verdict(
+                    "refuse",
+                    "G-13_write_needs_prerequisite",
+                    "我还需要先确认这本书的馆藏情况才能办理借阅或续借。"
+                    "麻烦您核对一下书名，或者先让我帮您查一下这本书有没有可借复本。",
+                    detail=f"tool={tool_name} evidence_checked=False",
+                ),
+                notes=["G-13_write_needs_prerequisite:refuse"],
+            )
 
         # G-04 写操作二次确认
         if tool.is_write:

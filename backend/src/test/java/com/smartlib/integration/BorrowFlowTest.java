@@ -54,6 +54,51 @@ class BorrowFlowTest {
     private StockStrategyFactory strategyFactory;
     @Autowired
     private ReaderFixture readerFixture;
+    @Autowired
+    private com.smartlib.service.BookService bookService;
+    @Autowired
+    private com.smartlib.cache.BookIdBloomFilter bloomFilter;
+
+    /**
+     * 库存缓存一致性回归用例。
+     *
+     * <p>守护一个被压测发现的真实缺陷：书目详情缓存里含 {@code availableCopies}，
+     * 但库存变化时<b>没有任何代码去失效它</b>，导致借出 8 册后详情接口仍返回 8
+     * （偏旧时长等于缓存 TTL，最长 10 分钟）。读者据此判断"还能借"，
+     * 到馆才发现借不到 —— 这正是需求里要解决的痛点之一。
+     *
+     * <p>修复方式：新增 {@code BookDetailCacheEvictor} 订阅库存变更事件主动失效缓存，
+     * 并把详情 TTL 从 10 分钟压到 30 秒（多实例下 L1 清不掉，只能靠短 TTL 兜底）。
+     */
+    @Test
+    @DisplayName("库存缓存一致性：借出后详情接口必须立刻反映新的可借数")
+    void bookDetailCacheInvalidatedOnStockChange() {
+        strategyFactory.switchTo("optimistic-db");
+        long bookId = newBook(3);
+
+        // 先读一次，把详情放进缓存（模拟读者先浏览了这本书的详情页）
+        assertThat(bookService.getById(bookId).availableCopies()).isEqualTo(3);
+
+        long readerId = readerFixture.newReader("UNDERGRAD", 100);
+        assertThat(borrowService.borrow(readerId, bookId, "cache-" + System.nanoTime()).ok()).isTrue();
+
+        // 借出后必须立刻看到 2，而不是缓存里的 3
+        assertThat(bookService.getById(bookId).availableCopies())
+                .as("库存变化后书目详情缓存必须被失效，否则读者会看到偏大的可借数")
+                .isEqualTo(2);
+
+        // 归还后同理：必须立刻回到 3
+        // 注意要用另一位读者：同一读者对同一本书只能持 1 册（业务规则 §2.2-5）
+        long anotherReader = readerFixture.newReader("POSTGRAD", 100);
+        BorrowResult second = borrowService.borrow(anotherReader, bookId, "cache2-" + System.nanoTime());
+        assertThat(second.ok()).isTrue();
+        assertThat(bookService.getById(bookId).availableCopies()).isEqualTo(1);
+
+        borrowService.returnBook(second.borrowId());
+        assertThat(bookService.getById(bookId).availableCopies())
+                .as("归还后详情缓存同样必须失效（库存回补要立刻可见）")
+                .isEqualTo(2);
+    }
 
     @Test
     @DisplayName("幂等：同一个 Idempotency-Key 重复提交只会借出一本")
@@ -219,6 +264,8 @@ class BorrowFlowTest {
         book.setPrice(new BigDecimal("30.00"));
         book.setTotalCopies(copies);
         bookMapper.insert(book);
+        // 必须登记布隆过滤器：否则 bookService.getById 会判定"一定不存在"而假性 404
+        bloomFilter.addBook(book.getId());
 
         BookStock stock = new BookStock();
         stock.setBookId(book.getId());

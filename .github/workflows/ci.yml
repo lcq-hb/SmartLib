@@ -43,12 +43,39 @@ permissions:
 
 jobs:
   # ===========================================================================
+  # 规范守卫：跑得极快（秒级），用来拦住"靠人自觉"一定会漏的事情
+  #   1) SQL 漂移：backend 与 deploy 两侧的 schema/data 必须一致
+  #      —— 曾经真实出现过"本地 24 本书、容器里只有 14 本"的问题
+  #   2) 实体类漂移：domain/entity 与 domain/dto 下由代码生成器产出的类，
+  #      必须与生成器保持一致（有人手改字段就会在这里被抓出来）
+  # ===========================================================================
+  guards:
+    name: guards (SQL / 代码生成一致性)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: SQL 漂移检测
+        run: python scripts/tools/check_sql_sync.py --verbose
+
+      - name: 实体类生成一致性检测
+        run: python scripts/tools/gen_entities.py --check
+
+  # ===========================================================================
   # 后端：编译 + 测试（含并发借阅/策略单测）
   # ===========================================================================
   backend:
     name: backend (Java 21 + Maven)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    needs: guards
 
     steps:
       - name: Checkout
@@ -134,6 +161,6 @@ jobs:
           name: agent-test-artifacts
           path: |
             agent-service/.pytest_cache/**
-            agent-service/eval/report.json
+            agent-service/app/eval/report.json
           if-no-files-found: ignore
           retention-days: 7

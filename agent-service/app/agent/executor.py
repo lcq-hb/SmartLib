@@ -81,7 +81,15 @@ class ToolExecutor:
         return self._call_counts.get(args_fingerprint(tool_name, raw_args), 0) >= self._loop_repeat_limit
 
     # ---------------- 执行 ----------------
-    async def execute(self, tool_name: str, raw_args: dict[str, Any]) -> ToolResult:
+    async def execute(
+        self, tool_name: str, raw_args: dict[str, Any], *, internal: bool = False
+    ) -> ToolResult:
+        """执行一个工具。
+
+        internal=True 表示这是**运行时内部补的步骤**（例如为了拿到真实 book_id
+        而补的 search_books），不是模型或读者要求的那次调用。它照常执行并计入
+        traces，但带 internal 标记，便于上游区分"读者问的工具"与"内部辅助步骤"。
+        """
         self._step += 1
         step = self._step
         started = time.perf_counter()
@@ -94,7 +102,7 @@ class ToolExecutor:
                 error_code="TOOL_NOT_FOUND",
                 error_message=f"工具 {tool_name} 不在白名单内",
             )
-            self._record(step, tool_name, raw_args, result, blocked_by="tool_whitelist")
+            self._record(step, tool_name, raw_args, result, blocked_by="tool_whitelist", internal=internal)
             return result
 
         fingerprint = args_fingerprint(tool_name, raw_args)
@@ -107,14 +115,14 @@ class ToolExecutor:
                     f"相同调用已重复 {self._call_counts[fingerprint]} 次，判定为循环，已中断"
                 ),
             )
-            self._record(step, tool_name, raw_args, result, blocked_by="loop_detection")
+            self._record(step, tool_name, raw_args, result, blocked_by="loop_detection", internal=internal)
             return result
         self._call_counts[fingerprint] = self._call_counts.get(fingerprint, 0) + 1
 
         args, failure = self.validate(tool_name, raw_args)
         if failure is not None:
             failure.latency_ms = (time.perf_counter() - started) * 1000
-            self._record(step, tool_name, raw_args, failure, blocked_by="argument_validation")
+            self._record(step, tool_name, raw_args, failure, blocked_by="argument_validation", internal=internal)
             return failure
 
         try:
@@ -150,7 +158,7 @@ class ToolExecutor:
             )
 
         result.latency_ms = (time.perf_counter() - started) * 1000
-        self._record(step, tool_name, raw_args, result)
+        self._record(step, tool_name, raw_args, result, internal=internal)
         return result
 
     def _record(
@@ -161,6 +169,7 @@ class ToolExecutor:
         result: ToolResult,
         *,
         blocked_by: str | None = None,
+        internal: bool = False,
     ) -> None:
         self.traces.append(
             ToolCallTrace(
@@ -171,6 +180,8 @@ class ToolExecutor:
                 ok=result.ok,
                 latency_ms=round(result.latency_ms, 1),
                 error_code=result.error_code,
+                error_message=result.error_message,
+                internal=internal,
                 summary=result.summary
                 or (friendly_reason(result.error_code, result.error_message or "") if not result.ok else ""),
                 blocked_by=blocked_by,

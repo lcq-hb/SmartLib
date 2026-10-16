@@ -58,7 +58,13 @@ smartlib:
       l1-max-size: 10000
       l1-ttl-seconds: 300
       # L2 Redis 缓存
-      l2-ttl-seconds: 1800
+      #
+      # 注意这个 TTL 是给"检索结果"用的，而检索结果里含 availableCopies（易变字段）。
+      # 因此它按"可接受的偏旧时长"来定，而不是按"书目多久变一次"来定：
+      # 默认 60 秒而不是 1800 秒 —— 压测中发现详情缓存偏旧 10 分钟会让读者白跑一趟，
+      # 检索结果同理，只是它是列表页、影响面略小。库存的权威读法始终是
+      # GET /internal/agent/tools/books/{id}/stock（直读数据库）。
+      l2-ttl-seconds: 60
       # TTL 随机抖动比例，防缓存雪崩
       ttl-jitter-ratio: 0.1
       # 布隆过滤器：预计元素数与可接受误判率

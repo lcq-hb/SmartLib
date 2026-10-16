@@ -209,7 +209,20 @@ create unique index uk_idem_key on idempotent_record (idem_key);
 create unique index uk_rule_key_type on rule_config (rule_key, reader_type);
 
 -- =============================================================================
--- 收尾：字符集兜底（H2 不支持这些语句，因此只在 MySQL 版本里出现）
--- 建表时未指定 CHARSET，取库默认值；这里再显式对齐一次，避免被 my.cnf 覆盖成 latin1。
+-- 收尾：为什么这里【没有】ALTER DATABASE ... CHARACTER SET
+--
+-- 早期版本在本文件末尾加过 `ALTER DATABASE smartlib CHARACTER SET utf8mb4 ...`，
+-- 实测结果是：H2 的语法解析器只接受 ALTER TABLE/USER/INDEX/SCHEMA/SEQUENCE/
+-- VIEW/DOMAIN/TYPE，遇到 ALTER DATABASE 直接报
+--   Syntax error ... expected "TABLE, USER, INDEX, SCHEMA, SEQUENCE, VIEW, DOMAIN, TYPE"
+-- 而本文件按 deploy/sql/README.md 的约定是【H2 MODE=MySQL 与 MySQL 8.0 共用】的
+-- 可移植子集（scripts/tools/check_sql_sync.py 会校验它与 backend 侧逐条一致），
+-- 因此那一行必须删掉，否则 H2 环境会在初始化阶段直接失败。
+--
+-- 字符集怎么保证（不靠这条语句）：
+--   1) 容器：docker-compose.yml 给 mysql 传了
+--      --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci
+--   2) 手工初始化：建库时显式指定
+--      CREATE DATABASE smartlib CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+--   3) 校验：SELECT @@character_set_server, @@collation_server;
 -- =============================================================================
-ALTER DATABASE smartlib CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;

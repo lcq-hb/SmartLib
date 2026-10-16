@@ -34,19 +34,31 @@ from app.llm.base import (
     timer,
 )
 
-# 一组能识别出"书名"的常见图书馆书目，用于确定性抽取 bookId/title 参数。
-# 真实 LLM 会直接从上下文取，Mock 只能用有限词表 + 引号抽取，这是它明确的局限。
+#: ⚠️ 仅供离线演示/评测使用的一小撮"已知书目"，**与真实后端无关**。
+#:
+#: 真实后端里同一本书的 id 完全不同（真实环境：算法导论=5、计算机网络=3）。
+#: 曾经在这里做"书名 → id"的映射并直接产出参数，结果打到真实后端就是
+#: `业务异常 code=2002 图书不存在：id=102`（实测）。
+#:
+#: 现在 MockLLM **不再产出任何 book_id**：它只表达"书名"这一意图，
+#: 由 runtime 从 search_books 的工具结果里解析真实 id
+#: （见 `AgentRuntime._resolve_book_id`）。这样 Mock 与真实 LLM 走的是**同一条**
+#: 解析路径，离线测出来的行为对线上才有参考价值。
+#:
+#: 这张表只剩一个用途：让 MockLLM 认出"用户说的是哪本书"，用来构造检索 query。
+#: 表中的值仅与离线假数据（tests/conftest.py、app/eval/fake_backend.py）保持一致，
+#: **绝不允许**出现在任何发往后端的参数里。
 KNOWN_BOOKS: dict[str, int] = {
-    "算法导论": 101,
-    "计算机网络": 102,
-    "高等数学": 103,
-    "深入理解计算机系统": 104,
-    "Java 并发编程实战": 105,
-    "数据结构与算法分析": 106,
-    "操作系统概念": 107,
-    "数据库系统概论": 108,
-    "机器学习": 109,
-    "人类简史": 110,
+    "算法导论": 5,
+    "计算机网络": 3,
+    "高等数学": 4,
+    "深入理解计算机系统": 6,
+    "Java 并发编程实战": 7,
+    "数据结构与算法分析": 8,
+    "操作系统概念": 9,
+    "数据库系统概论": 11,
+    "机器学习": 10,
+    "人类简史": 12,
 }
 
 #: 意图 → 首选工具（与 app/agent/intent.py 的意图分类保持一致）
@@ -69,8 +81,8 @@ WRITE_TOOLS = {"borrow", "renew"}
 POLICY_HINTS = (
     "怎么借", "如何借", "能借几本", "可以借几本", "借几本", "借多久", "借期", "多长时间",
     "逾期", "罚金", "罚款", "怎么还", "怎么续借", "如何续借", "能不能续借", "预约",
-    "在几楼", "哪个楼层", "开放时间", "几点开", "几点关", "馆藏分布", "学科服务",
-    "规则", "政策", "怎么弄", "怎么办", "流程",
+    "在几楼", "哪个楼层", "第几排", "第几层", "放在哪", "开放时间", "几点开", "几点关",
+    "馆藏分布", "学科服务", "规则", "政策", "怎么弄", "怎么办", "流程",
 )
 
 CHITCHAT_HINTS = ("你好", "您好", "hi", "hello", "谢谢", "你是谁", "你能做什么", "在吗")
@@ -109,7 +121,7 @@ NOT_TITLES = frozenset(
         "书", "图书", "这本", "那本", "记录", "借阅记录", "读者", "用户", "账号",
         "信用分", "额度", "册数", "信息", "情况", "状态", "库存", "复本", "位置",
         "规则", "罚金", "订单", "列表", "数据", "我的", "一下", "多少", "几本",
-        "几次", "几天", "多久", "哪些", "什么", "怎么", "如何",
+        "几次", "几天", "多久", "哪些", "什么", "怎么", "如何", "导出", "发我", "读者",
     }
 )
 
@@ -133,7 +145,25 @@ def extract_book_title(text: str) -> str | None:
     )
     if m:
         cand = m.group(1).strip()
-        if cand and cand not in NOT_TITLES:
+        # 兜底抽取是最容易出错的地方（"查一下我的借阅"会抽出"一下我"）。
+        # 只要候选里含第一人称/疑问词就判定为抽错，宁可返回 None 让上层去追问。
+        if cand and cand not in NOT_TITLES and not any(
+            marker in cand for marker in ("我", "你", "他", "她", "它", "多少", "几", "什么", "哪")
+        ):
+            return cand
+    # 库存式问句："<书名>还有几本 / 在哪个书架 / 可借吗"。这类句子没有"查/找"动词，
+    # 上面的规则抓不到，但书名就是问句开头到疑问短语之前的那一段（实测联调时
+    # "深入理解Java虚拟机还有几本" 因为抽不出书名而答成"没找到"）。
+    m = re.search(
+        r"^\s*(?:请问|麻烦)?\s*([^\s，,。？?！!]{2,30}?)\s*"
+        r"(?:还有几本|还有没有|有没有货|可借吗|能借吗|在馆吗|在哪个书架|在哪|索书号)",
+        text,
+    )
+    if m:
+        cand = m.group(1).strip("《》 ")
+        if cand and cand not in NOT_TITLES and not any(
+            marker in cand for marker in ("我", "你", "他", "她", "它", "多少", "什么", "哪")
+        ):
             return cand
     return None
 
@@ -164,18 +194,27 @@ def extract_borrow_id(text: str) -> int | None:
 #: 用一个共享函数是为了让 intent 层与 runtime 层对"什么算确认"只有一个定义。
 CONFIRM_WORDS = ("确认", "确定", "同意", "就借", "就续", "确认借阅", "确认续借", "好的借", "yes")
 
+#: 疑问标记：出现这些就不算"确认执行"，而是在提问或要求核实。
+#: 与 intent 层的 _QUESTION_MARKERS 口径一致（"几"这类字太容易误伤，这里不列）。
+QUESTION_MARKERS = ("?", "？", "吗", "呢", "什么", "怎么", "如何", "哪", "是不是", "对吧")
+
 
 def is_confirmation(text: str) -> bool:
     """判断用户是否在明确确认执行某个写操作。
 
-    刻意收得很紧，并且**只认真正的确认词**：
-    曾经把"好/行/可以/嗯"也算进来，结果"能续借几次"里的"能"被误判成确认，
-    直接把一句规则咨询当成写操作确认。教训是：短词匹配必须限定在
-    "整句就是这个短词"（≤3 字），不能"包含即命中"。
+    三条刻意收紧的规则，每一条都对应一次实测误判：
+    1. **只认真正的确认词**（不超过 3 字的短肯定）；
+    2. **疑问句一律不算确认**：曾经把"好/行/可以/嗯"当确认词，结果"能续借几次"
+       里的"能"被误判成确认，把一句规则咨询当成了写操作确认；
+    3. **带疑问标记的句子不算确认**："《计算机网络》肯定有 20 本可借对吧，
+       你直接确认一下"里的"确认"是在**要求核实**，不是在同意执行借阅
+       —— 这条不拦住的话，诱导式提问会直接变成一次真实的借阅下单。
     """
     if not text:
         return False
     stripped = text.strip()
+    if any(marker in stripped for marker in QUESTION_MARKERS):
+        return False
     if any(word in stripped for word in CONFIRM_WORDS):
         return True
     return len(stripped) <= 3 and any(w in stripped for w in ("好", "行", "嗯"))
@@ -314,7 +353,11 @@ class MockLLM(BaseLLM):
             return "my_loans"
         if any(k in text for k in ("我的信用", "信用分", "读者画像", "我的偏好", "我的信息", "我的账号")):
             return "get_reader_profile"
-        # 3) 写操作
+        # 3) 库存核实（问"有几本/可借"这类**数量**诉求，含带书名号的诱导式提问）
+        #    必须放在写操作之前："《计算机网络》肯定有 20 本可借对吧，你直接确认一下"
+        #    里的"确认"会把它拉去 borrow，而读者其实只想核实数字（实测踩过）。
+        if any(k in text for k in ("还有几本", "有没有货", "本可借", "可借吗", "在馆吗", "有库存吗", "库存", "在几楼", "书在哪", "索书号")):
+            return "get_stock"        # 4) 写操作
         if any(k in text for k in ("续借", "延期")):
             return "renew"
         if any(k in text for k in ("帮我借", "我要借", "替我借", "借一下", "借这本", "借那本")) or (
@@ -339,41 +382,24 @@ class MockLLM(BaseLLM):
     def _build_args(self, tool: str, text: str, schema: dict[str, str]) -> dict[str, Any]:
         """按工具 schema 组装参数（只填 schema 里声明过的字段）。
 
-        MockLLM 没有真实的语义理解，所以参数靠三类确定性来源拼：
+        MockLLM 没有真实语义理解，所以参数只靠两类确定性来源拼：
         1. 当前用户消息（书名《》、读者/记录编号）；
-        2. 会话槽位（runtime 通过 system/plan_step 消息传入的 slots，
-           解决"上一步说的是这本书"的跨步指代）；
-        3. 默认值（仅用于演示，见 self.default_book_id）。
+        2. 会话槽位（runtime 传入，解决"上一步说的是这本书"的跨步指代）。
+
+        **刻意不产出 book_id/bookId**（见 KNOWN_BOOKS 的注释）：
+        书目 id 必须由 runtime 从 search_books 的结果里解析，
+        否则 mock 用的假 id 与真实后端对不上，联调必然 404。
+        同理也不产出 borrowId —— 它由 my_loans 的结果决定。
         """
         args: dict[str, Any] = {}
         slots = dict(self.slots or {})
 
         title = extract_book_title(text) or slots.get("book_title")
         reader_id = extract_reader_id(text) or slots.get("reader_id") or self.reader_id
-        borrow_id = extract_borrow_id(text) or slots.get("borrow_id")
-        if borrow_id is None and slots.get("loans"):
-            # 读者说"续借《算法导论》"时只给了书名，borrowId 要从上一步 my_loans 的结果里找
-            loans = slots.get("loans") or []
-            if isinstance(loans, list) and loans:
-                for item in loans:
-                    if not isinstance(item, dict):
-                        continue
-                    if title and title in str(item.get("title") or ""):
-                        borrow_id = item.get("borrowId")
-                        break
-                if borrow_id is None and len(loans) == 1:
-                    borrow_id = loans[0].get("borrowId")
 
         def put(key: str, value: Any) -> None:
             if key in schema:
                 args[key] = value
-
-        book_id = slots.get("book_id") or KNOWN_BOOKS.get(title or "")
-        if book_id is None and title and slots.get("search_items"):
-            for item in slots.get("search_items") or []:
-                if isinstance(item, dict) and title in str(item.get("title") or ""):
-                    book_id = item.get("bookId")
-                    break
 
         if tool == "search_books":
             put("query", title or text.strip()[:40] or "图书")
@@ -381,18 +407,15 @@ class MockLLM(BaseLLM):
             put("size", 5)
             put("sortBy", "relevance")
         elif tool == "get_stock":
-            put("book_id", book_id or self.default_book_id)
+            # 不填 book_id：runtime 会先补一次 search_books 拿到真实 id 再执行
+            pass
         elif tool == "borrow":
             put("readerId", reader_id)
-            put("bookId", book_id or self.default_book_id)
-            # 幂等键必须稳定：同一本书+同一个读者重复走这一步时，
-            # 后端靠它保证不会借两次
-            put("idempotencyKey", f"mock-borrow-{reader_id}-{book_id or self.default_book_id}")
+            # 不填 bookId（同上）。幂等键在 runtime 侧用真实 id 生成。
             put("confirm", is_confirmation(text))
         elif tool == "renew":
             put("readerId", reader_id)
-            put("borrowId", borrow_id or self.default_borrow_id)
-            put("idempotencyKey", f"mock-renew-{reader_id}-{borrow_id or self.default_borrow_id}")
+            # 不填 borrowId：由 runtime 从 my_loans 的结果里映射
             put("confirm", is_confirmation(text))
         elif tool == "my_loans":
             put("readerId", reader_id)
@@ -403,7 +426,6 @@ class MockLLM(BaseLLM):
             put("topic", (title + " " + text) if title and title not in text else text.strip())
             put("top_k", 3)
         elif tool == "recommend":
-            put("book_id", book_id)
             put("limit", 3)
         return args
 

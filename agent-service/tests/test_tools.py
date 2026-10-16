@@ -183,7 +183,7 @@ async def test_search_books_empty_result_is_not_an_error(test_settings, fake_bac
 @pytest.mark.asyncio
 async def test_get_stock_available(test_settings, fake_backend) -> None:
     result = await STOCK.handle(
-        STOCK.args_model.model_validate({"book_id": 101}), ctx_for(test_settings, fake_backend)
+        STOCK.args_model.model_validate({"book_id": 5}), ctx_for(test_settings, fake_backend)
     )
     assert result.ok is True
     assert result.data["available"] == 3
@@ -196,7 +196,7 @@ async def test_get_stock_indeterminate_minus_one(test_settings, fake_backend) ->
     """availableCopies == -1 是"库存无法确认"，绝不能当成"没有库存"。"""
     fake_backend.stock_available = -1
     result = await STOCK.handle(
-        STOCK.args_model.model_validate({"book_id": 101}), ctx_for(test_settings, fake_backend)
+        STOCK.args_model.model_validate({"book_id": 5}), ctx_for(test_settings, fake_backend)
     )
     assert result.ok is True
     assert result.data["available"] == -1
@@ -210,7 +210,7 @@ async def test_get_stock_indeterminate_minus_one(test_settings, fake_backend) ->
 async def test_get_stock_zero_means_can_reserve(test_settings, fake_backend) -> None:
     fake_backend.stock_available = 0
     result = await STOCK.handle(
-        STOCK.args_model.model_validate({"book_id": 101}), ctx_for(test_settings, fake_backend)
+        STOCK.args_model.model_validate({"book_id": 5}), ctx_for(test_settings, fake_backend)
     )
     assert result.data["available"] == 0
     assert result.data["indeterminate"] is False
@@ -246,7 +246,7 @@ async def test_borrow_requires_confirmation(test_settings, fake_backend) -> None
     with pytest.raises(ToolError) as exc:
         await BORROW.handle(
             BORROW.args_model.model_validate(
-                {"readerId": 1001, "bookId": 101, "idempotencyKey": "k" * 10, "confirm": False}
+                {"readerId": 1001, "bookId": 5, "idempotencyKey": "k" * 10, "confirm": False}
             ),
             ctx_for(test_settings, fake_backend),
         )
@@ -262,7 +262,7 @@ async def test_borrow_rejects_other_reader(test_settings, fake_backend) -> None:
     with pytest.raises(ToolError) as exc:
         await BORROW.handle(
             BORROW.args_model.model_validate(
-                {"readerId": 2002, "bookId": 101, "idempotencyKey": "k" * 10, "confirm": True}
+                {"readerId": 2002, "bookId": 5, "idempotencyKey": "k" * 10, "confirm": True}
             ),
             ctx_for(test_settings, fake_backend, reader_id=1001),
         )
@@ -275,7 +275,7 @@ async def test_borrow_without_reader_identity_asks_for_it(test_settings, fake_ba
     with pytest.raises(ToolError) as exc:
         await BORROW.handle(
             BORROW.args_model.model_validate(
-                {"readerId": 1001, "bookId": 101, "idempotencyKey": "k" * 10, "confirm": True}
+                {"readerId": 1001, "bookId": 5, "idempotencyKey": "k" * 10, "confirm": True}
             ),
             ctx_for(test_settings, fake_backend, reader_id=None),
         )
@@ -287,7 +287,7 @@ async def test_borrow_without_reader_identity_asks_for_it(test_settings, fake_ba
 async def test_borrow_success_passes_reader_and_idempotency_key(test_settings, fake_backend) -> None:
     result = await BORROW.handle(
         BORROW.args_model.model_validate(
-            {"readerId": 1001, "bookId": 101, "idempotencyKey": "idem-0001", "confirm": True}
+            {"readerId": 1001, "bookId": 5, "idempotencyKey": "idem-0001", "confirm": True}
         ),
         ctx_for(test_settings, fake_backend),
     )
@@ -309,7 +309,7 @@ async def test_borrow_translates_backend_reason_to_chinese(test_settings, fake_b
     with pytest.raises(ToolError) as exc:
         await BORROW.handle(
             BORROW.args_model.model_validate(
-                {"readerId": 1001, "bookId": 101, "idempotencyKey": "k" * 10, "confirm": True}
+                {"readerId": 1001, "bookId": 5, "idempotencyKey": "k" * 10, "confirm": True}
             ),
             ctx_for(test_settings, fake_backend),
         )
@@ -334,7 +334,7 @@ async def test_borrow_timeout_says_result_unknown(test_settings) -> None:
     with pytest.raises(ToolError) as exc:
         await BORROW.handle(
             BORROW.args_model.model_validate(
-                {"readerId": 1001, "bookId": 101, "idempotencyKey": "k" * 10, "confirm": True}
+                {"readerId": 1001, "bookId": 5, "idempotencyKey": "k" * 10, "confirm": True}
             ),
             ctx,
         )
@@ -535,7 +535,7 @@ async def test_policy_qa_raises_when_nothing_matches(test_settings) -> None:
 @pytest.mark.asyncio
 async def test_recommend_by_seed_book(test_settings, fake_backend) -> None:
     result = await RECOMMEND.handle(
-        RECOMMEND.args_model.model_validate({"book_id": 101, "limit": 2}),
+        RECOMMEND.args_model.model_validate({"book_id": 5, "limit": 2}),
         ctx_for(test_settings, fake_backend),
     )
     assert result.data["strategy"] == "similar_books"
@@ -559,7 +559,7 @@ async def test_recommend_falls_back_to_hot(test_settings, fake_backend) -> None:
         settings=test_settings,
     )
     result = await RECOMMEND.handle(
-        RECOMMEND.args_model.model_validate({"book_id": 101, "limit": 2}), ctx
+        RECOMMEND.args_model.model_validate({"book_id": 5, "limit": 2}), ctx
     )
     assert result.data["strategy"] == "hot_fallback"
     assert result.data["degraded"] is True
@@ -616,7 +616,7 @@ async def test_get_request_retries_on_5xx(test_settings, fake_backend) -> None:
     """GET 是幂等安全的：5xx 必须重试（默认 2 次，共 3 次尝试）。"""
     fake_backend.fail_times = 2
     async with JavaClient(test_settings, transport=fake_backend.transport()) as client:
-        data = await client.get_stock(book_id=101, trace_id="t")
+        data = await client.get_stock(book_id=5, trace_id="t")
     assert data["available"] == 3
     assert len(fake_backend.calls) == 3
 
@@ -629,7 +629,7 @@ async def test_post_without_idempotency_check_still_retries_when_marked_idempote
     fake_backend.fail_times = 1
     async with JavaClient(test_settings, transport=fake_backend.transport()) as client:
         result = await client.borrow(
-            reader_id=1001, book_id=101, idempotency_key="idem-x", trace_id="t"
+            reader_id=1001, book_id=5, idempotency_key="idem-x", trace_id="t"
         )
     assert result["ok"] is True
     assert len(fake_backend.calls) == 2
@@ -640,7 +640,7 @@ async def test_circuit_opens_after_consecutive_failures(test_settings, fake_back
     fake_backend.always_fail = True
     client = JavaClient(test_settings, transport=fake_backend.transport())
     with pytest.raises(Exception):
-        await client.get_stock(book_id=101, trace_id="t")
+        await client.get_stock(book_id=5, trace_id="t")
     # 熔断阈值默认 5，但每次调用内部还会重试 3 次；用直接调 request 的方式精确计数
     client.breaker.reset()
     fake_backend.clear()
@@ -649,7 +649,7 @@ async def test_circuit_opens_after_consecutive_failures(test_settings, fake_back
     assert client.breaker.state == "OPEN"
     calls_before = len(fake_backend.calls)
     with pytest.raises(CircuitOpenError):
-        await client.get_stock(book_id=101, trace_id="t")
+        await client.get_stock(book_id=5, trace_id="t")
     # 熔断打开后**不再打后端**（快速失败，保护上游）
     assert len(fake_backend.calls) == calls_before
     await client.aclose()
@@ -697,7 +697,7 @@ async def test_4xx_does_not_retry(test_settings, fake_backend) -> None:
     fake_backend.status_code_times = {400: 5}
     async with JavaClient(test_settings, transport=fake_backend.transport()) as client:
         with pytest.raises(UpstreamError):
-            await client.get_stock(book_id=101, trace_id="t")
+            await client.get_stock(book_id=5, trace_id="t")
     assert len(fake_backend.calls) == 1
 
 

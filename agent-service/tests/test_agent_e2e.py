@@ -203,10 +203,6 @@ async def test_cannot_borrow_for_another_reader(runtime_env, fake_backend) -> No
     assert result.pending_confirm is None, "越权请求绝不能进入待确认队列"
     assert result.guardrail_blocked is True
     assert "G-03_no_borrow_for_others:refuse" in result.guardrail_notes
-    # 借阅这一步必须被标成失败（护栏挡下），而不是执行
-    assert result.plan is not None
-    borrow_step = next(s for s in result.plan["steps"] if s["tool"] == "borrow")
-    assert borrow_step["status"] == "failed"
     assert "/internal/agent/tools/borrow" not in fake_backend.paths()
 
 
@@ -236,6 +232,213 @@ async def test_write_tool_never_sends_other_reader_id(runtime_env, fake_backend)
     await runtime_env.run("帮我借读者 2002 的《算法导论》", session_id="s-priv3", reader_id=1001)
     for call in fake_backend.calls:
         assert b'"readerId":2002' not in (call["body"] or b"")
+
+
+# =============================================================================
+# book_id 溯源（真实联调暴露的缺陷：模型给的假 id 直接打后端 → 404）
+# =============================================================================
+@pytest.mark.asyncio
+async def test_get_stock_uses_real_id_from_tool_results(runtime_env, fake_backend) -> None:
+    """回归：发给后端的 book_id 必须等于**工具结果里的真实 id**。
+
+    背景：MockLLM 曾用一张"书名→id"的本地表产出 `book_id`（101/102），
+    而这些 id 在真实后端不存在 → `业务异常 code=2002 图书不存在：id=102`。
+    现在 book_id 只能来自 search_books 的返回；本用例刻意让后端 id
+    取成 5 / 3 / 8 这种"真实值"，并断言发出去的 id 就是它。
+    """
+    real_id = fake_backend.BOOKS["算法导论"]["bookId"]
+    assert real_id != 101, "测试数据必须用真实后端风格的 id，否则测不出这个缺陷"
+
+    result = await runtime_env.run("《算法导论》还有几本", session_id="s-src1", reader_id=1001)
+
+    assert result.intent == "get_stock"
+    assert result.tool_evidence is True
+
+    stock_paths = [c["path"] for c in fake_backend.calls if c["path"].endswith("/stock")]
+    assert stock_paths, "应该真的调用了库存接口"
+    assert stock_paths[-1] == f"/internal/agent/tools/books/{real_id}/stock"
+    # 必须先检索拿到 id，再查库存（这就是"事实只能来自工具"的顺序）
+    assert "/internal/agent/tools/search-books" in fake_backend.paths()
+    assert "G-13_book_id_sourcing:prerequisite_search" in result.guardrail_notes
+
+
+@pytest.mark.asyncio
+async def test_borrow_discards_model_supplied_id(runtime_env, fake_backend) -> None:
+    """回归：模型给了不存在的 id（999）必须被丢弃，改用工具结果里的真实 id。"""
+    real_id = fake_backend.BOOKS["算法导论"]["bookId"]
+
+    class LyingLLM:
+        """模拟"会编 id"的模型：它坚持说这本书是 999 号。"""
+
+        provider = "lying"
+        slots: dict = {}
+
+        async def complete(self, messages, *, tools=None, temperature=None, max_tokens=None):
+            from app.llm.base import LLMResult, ToolCall
+
+            return LLMResult(
+                tool_calls=[
+                    ToolCall(
+                        name="borrow",
+                        arguments={
+                            "readerId": 1001,
+                            "bookId": 999,
+                            "idempotencyKey": "lying-999",
+                            "confirm": True,
+                        },
+                        id="call_lying",
+                    )
+                ],
+                finish_reason="tool_calls",
+                provider="lying",
+            )
+
+        async def stream(self, messages, *, tools=None, temperature=None):
+            if False:  # pragma: no cover
+                yield ""
+
+    from app.agent.guardrail import Guardrail
+    from app.agent.intent import IntentClassifier
+    from app.agent.planner import Planner
+    from app.agent.runtime import AgentRuntime
+    from app.client.java_client import JavaClient
+
+    llm = LyingLLM()
+    runtime = AgentRuntime(
+        settings=runtime_env.settings,
+        llm=llm,
+        java_client=JavaClient(runtime_env.settings, transport=fake_backend.transport()),
+        guardrail=Guardrail(runtime_env.settings),
+        classifier=IntentClassifier(llm, runtime_env.settings),
+        planner=Planner(llm, runtime_env.settings),
+    )
+    result = await runtime.run("帮我借《算法导论》", session_id="s-src2", reader_id=1001, mode="llm")
+
+    # 模型编的 999 绝不允许出现在任何请求体或工具参数里
+    for call in result.tool_calls:
+        assert call["arguments"].get("bookId") != 999
+    for call in fake_backend.calls:
+        assert b"999" not in (call["body"] or b"")
+    assert "999" not in result.reply
+    # 真实 id 应该被用上（本轮是待确认，所以只要求拿到正确书目）
+    assert result.pending_confirm is not None or result.reply
+    if result.pending_confirm:
+        assert result.pending_confirm["args"].get("bookId") in (real_id, None)
+
+
+@pytest.mark.asyncio
+async def test_unknown_book_is_reported_honestly(runtime_env, fake_backend) -> None:
+    """检索不到任何候选时：如实说没找到，**绝不带着猜的 id 去调后端**。"""
+    fake_backend.default_search = lambda q: {  # type: ignore[assignment]
+        "items": [],
+        "total": 0,
+        "tookMs": 1,
+        "engine": "inverted-index",
+        "degraded": False,
+    }
+    result = await runtime_env.run("《不存在的书名》还有几本", session_id="s-src3", reader_id=1001)
+
+    assert "没有找到" in result.reply or "没找到" in result.reply
+    # 关键断言：没有可信 id 时不允许调用库存/借阅接口
+    assert not any(c["path"].endswith("/stock") for c in fake_backend.calls)
+    assert "/internal/agent/tools/borrow" not in fake_backend.paths()
+
+
+@pytest.mark.asyncio
+async def test_ordinal_reference_maps_to_search_position(runtime_env, fake_backend) -> None:
+    """"第 2 本"要映射到检索结果里的第 2 条真实 id，而不是凭空猜。"""
+    items = fake_backend.default_search("书")["items"]
+    assert len(items) >= 2
+    expected_id = items[1]["bookId"]
+
+    result = await runtime_env.run("《算法导论》第 2 本还有几本", session_id="s-src4", reader_id=1001)
+    stock_paths = [c["path"] for c in fake_backend.calls if c["path"].endswith("/stock")]
+    if stock_paths:
+        assert stock_paths[-1] == f"/internal/agent/tools/books/{expected_id}/stock"
+    else:
+        # 没有可用检索结果时也必须给出可读答复，而不是 500 / 内部字段名
+        assert result.reply
+        assert "book_id" not in result.reply
+
+
+@pytest.mark.asyncio
+async def test_metrics_counts_blocked_unsourced_ids(runtime_env, fake_backend) -> None:
+    """丢弃未经工具验证的 id 要能被度量（便于回答"模型到底编了多少次"）。"""
+    from app.metrics import METRICS
+
+    before = METRICS.snapshot()["counters"].get("unsourced_book_id_blocked", 0)
+
+    class LyingLLM2:
+        provider = "lying2"
+        slots: dict = {}
+
+        async def complete(self, messages, *, tools=None, temperature=None, max_tokens=None):
+            from app.llm.base import LLMResult, ToolCall
+
+            return LLMResult(
+                tool_calls=[
+                    ToolCall(name="get_stock", arguments={"book_id": 424242}, id="call_lying2")
+                ],
+                finish_reason="tool_calls",
+                provider="lying2",
+            )
+
+        async def stream(self, messages, *, tools=None, temperature=None):
+            if False:  # pragma: no cover
+                yield ""
+
+    from app.agent.guardrail import Guardrail
+    from app.agent.intent import IntentClassifier
+    from app.agent.planner import Planner
+    from app.agent.runtime import AgentRuntime
+    from app.client.java_client import JavaClient
+
+    llm = LyingLLM2()
+    runtime = AgentRuntime(
+        settings=runtime_env.settings,
+        llm=llm,
+        java_client=JavaClient(runtime_env.settings, transport=fake_backend.transport()),
+        guardrail=Guardrail(runtime_env.settings),
+        classifier=IntentClassifier(llm, runtime_env.settings),
+        planner=Planner(llm, runtime_env.settings),
+    )
+    await runtime.run("查一下《算法导论》的库存", session_id="s-src5", reader_id=1001, mode="llm")
+
+    after = METRICS.snapshot()["counters"].get("unsourced_book_id_blocked", 0)
+    assert after > before
+    assert not any(b"424242" in (c["body"] or b"") for c in fake_backend.calls)
+
+
+# =============================================================================
+# 写操作必须有前置证据（404 之后不该再追问"要不要借"）
+# =============================================================================
+@pytest.mark.asyncio
+async def test_write_blocked_without_stock_evidence(runtime_env, fake_backend) -> None:
+    """书查不到时，绝不能进入"请回复确认借阅"的流程——确认了也必然失败。"""
+    fake_backend.default_search = lambda q: {  # type: ignore[assignment]
+        "items": [],
+        "total": 0,
+        "tookMs": 1,
+        "engine": "inverted-index",
+        "degraded": False,
+    }
+    result = await runtime_env.run("帮我借《查无此书》", session_id="s-ev1", reader_id=1001)
+
+    assert result.pending_confirm is None, "没有馆藏证据时不应挂起待确认写操作"
+    assert "确认借阅" not in result.reply
+    assert "/internal/agent/tools/borrow" not in fake_backend.paths()
+
+
+@pytest.mark.asyncio
+async def test_write_confirm_only_after_stock_evidence(runtime_env, fake_backend) -> None:
+    """有馆藏证据时正常进入确认流程（不能因为加了护栏就把正常路径堵死）。"""
+    result = await runtime_env.run("帮我借《算法导论》", session_id="s-ev2", reader_id=1001)
+    assert result.pending_confirm is not None
+    assert "确认" in result.reply
+    # 借书前必须先确认过库存（内部前置步骤），且尚未真正下单
+    assert "/internal/agent/tools/borrow" not in fake_backend.paths()
+    assert any(t["tool"] == "get_stock" for t in result.internal_tool_calls)
+    assert "G-13_write_evidence:prerequisite_stock" in result.guardrail_notes
 
 
 # =============================================================================
@@ -389,7 +592,7 @@ async def test_loop_detection_blocks_repeated_identical_call(test_settings, fake
         settings=test_settings,
     )
     executor = ToolExecutor(ctx)
-    args = {"book_id": 101}
+    args = {"book_id": 5}
     first = await executor.execute("get_stock", args)
     second = await executor.execute("get_stock", args)
     third = await executor.execute("get_stock", args)

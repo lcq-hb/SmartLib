@@ -31,6 +31,7 @@ ROUTING_CASES: list[tuple[str, str]] = [
     ("怎么续借", "policy_qa"),
     ("能续借几次", "policy_qa"),
     ("我的书快到期了能延期吗", "renew_book"),
+    ("续借规则是什么", "policy_qa"),
     # 个人数据 vs 规则
     ("我借了哪些书", "my_loans"),
     ("我有没有逾期的书", "my_loans"),
@@ -38,7 +39,9 @@ ROUTING_CASES: list[tuple[str, str]] = [
     ("逾期罚金怎么算", "policy_qa"),
     ("我的信用分是多少", "reader_profile"),
     ("我能借几本", "reader_profile"),
-    ("研究生一次能借多少册", "reader_profile"),
+    # "研究生一次能借多少册"没有第一人称 → 问的是**规则**（policy_qa）；
+    # 有第一人称的"我能借几本"才查读者档案。这是一条刻意保留的歧义分界线。
+    ("研究生一次能借多少册", "policy_qa"),
     ("我的借阅额度还剩多少", "reader_profile"),
     # 库存 vs 规则（"在几楼"是知识，"还有几本"是实时数据）
     ("《算法导论》还有几本", "get_stock"),

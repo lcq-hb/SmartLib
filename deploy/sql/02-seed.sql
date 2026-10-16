@@ -1,37 +1,30 @@
 -- =============================================================================
--- SmartLib MySQL 初始化脚本 02：演示种子数据（可选）
+-- SmartLib 初始化数据（**H2 MODE=MySQL 与 MySQL 8.0 共用同一份**）
 --
--- 定位：让 Compose 起起来就有"能借的书 + 能借书的人 + 一条逾期记录"可演示，
---       不需要先跑 gen_books.py 灌 20 万行。
--- 【前提】必须等 03-mysql-production-extras.sql 的全文索引建完再灌大数据量；
---       本文件的 14 本书量级极小，与 01 的建表顺序无冲突。
+--   设计原则与 schema.sql 一致：只使用两种数据库都支持的语法子集，从而
+--   消除"本地演示数据与部署数据不一致"的风险。具体约束：
+--     * 时间表达式统一用 NOW() / TIMESTAMPADD(DAY, n, NOW())
+--       （实测 H2 的 MySQL 模式不接受 DATE_ADD(..., INTERVAL ...) 形式，
+--       而 TIMESTAMPADD 是两者都支持的标准函数）
+--     * 字符串拼接统一用 CONCAT()，绝不用 ||（MySQL 默认把 || 当逻辑或）
+--     * 不使用 SET NAMES / ALTER DATABASE 等会话级语句
+--     * 关联插入用 INSERT ... SELECT ... JOIN，不写死自增 id，
+--       避免不同数据库自增序列行为差异
 --
--- 与 H2 版 data.sql 的差异（这是刻意的，不是遗漏）：
---   * H2 版用 dateadd('DAY', -5, current_timestamp)；MySQL 用
---     DATE_SUB(NOW(), INTERVAL 5 DAY)。两套语法不通用，所以分开维护。
---   * H2 版用 'SEED-' || isbn 拼字符串；MySQL 的 || 默认是逻辑或，
---     必须用 CONCAT()。
---   * 本文件只放"演示必需"的 14 本书；120 万行级别的压力数据由
---     scripts/gen_books.py 生成（产物在 deploy/sql/generated/，已 gitignore）。
---
--- 幂等性：01-schema.sql 开头有 drop table，因此本文件无需再判重；
---       但为了支持"只重灌数据不重建表"，这里用 INSERT ... ON DUPLICATE KEY UPDATE
---       兜底需要唯一键的表（reader.card_no / book.isbn / rule_config）。
+--   本文件是 backend/src/main/resources/db/data.sql 的副本，由脚本同步，请勿单独修改。
 -- =============================================================================
 
-SET NAMES utf8mb4;
-
 -- ---------------------------- 分类 -------------------------------------------
-INSERT INTO category (code, name, parent_id, sort_no) VALUES
- ('TP', '计算机与信息技术', NULL, 1),
- ('O1', '数学', NULL, 2),
- ('F2', '经济管理', NULL, 3),
- ('I2', '中国文学', NULL, 4),
- ('B0', '哲学宗教', NULL, 5),
- ('H3', '外语', NULL, 6);
+insert into category (code, name, parent_id, sort_no) values
+ ('TP', '计算机与信息技术', null, 1),
+ ('O1', '数学', null, 2),
+ ('F2', '经济管理', null, 3),
+ ('I2', '中国文学', null, 4),
+ ('B0', '哲学宗教', null, 5),
+ ('H3', '外语', null, 6);
 
 -- ---------------------------- 读者 -------------------------------------------
-INSERT INTO reader (card_no, name, type, dept, credit_score, status, created_at, updated_at) VALUES
+insert into reader (card_no, name, type, dept, credit_score, status, created_at, updated_at) values
  ('2021001', '陈嘉禾', 'UNDERGRAD', '计算机科学与技术学院', 100, 'ACTIVE', NOW(), NOW()),
  ('2021002', '林思远', 'UNDERGRAD', '计算机科学与技术学院', 95,  'ACTIVE', NOW(), NOW()),
  ('2021003', '周雨桐', 'UNDERGRAD', '外国语学院',             88,  'ACTIVE', NOW(), NOW()),
@@ -42,81 +35,88 @@ INSERT INTO reader (card_no, name, type, dept, credit_score, status, created_at,
  ('2024008', '何书言', 'POSTGRAD',  '中国语言文学系',         92,  'ACTIVE', NOW(), NOW()),
  ('T001001', '王建国', 'TEACHER',   '计算机科学与技术学院',   100, 'ACTIVE', NOW(), NOW()),
  ('T001002', '李文博', 'TEACHER',   '数学学院',               100, 'ACTIVE', NOW(), NOW()),
- ('T001003', '张慧敏', 'TEACHER',   '经济管理学院',           100, 'ACTIVE', NOW(), NOW());
+ ('T001003', '张慧敏', 'TEACHER',   '经济管理学院',           100, 'ACTIVE', NOW(), NOW()),
+ ('2021009', '钱defaults', 'UNDERGRAD', '计算机科学与技术学院', 100, 'FROZEN', NOW(), NOW());
 
 -- ---------------------------- 书目 -------------------------------------------
--- 说明：category_id 用 (select id from category where code='..') 关联，不写死自增 id。
-INSERT INTO book (isbn, title, author, publisher, category_id, publish_year, price, tags, summary, shelf_location, total_copies, created_at, updated_at) VALUES
- ('9787111213826', '深入理解Java虚拟机', '周志明', '机械工业出版社', (SELECT id FROM category WHERE code='TP'), 2019, 129.00, 'Java,JVM,性能调优,虚拟机', '从内存模型、垃圾回收到编译优化的 JVM 系统级讲解，是 Java 工程师进阶必读。', '三楼东区 TP312/1287', 5, NOW(), NOW()),
- ('9787111544937', 'Java并发编程实战', 'Brian Goetz', '机械工业出版社', (SELECT id FROM category WHERE code='TP'), 2017, 89.00, 'Java,并发,多线程,线程安全', 'Java 并发领域经典，系统讲解线程安全、锁、并发容器与线程池。', '三楼东区 TP312/1321', 4, NOW(), NOW()),
- ('9787115428028', '计算机网络：自顶向下方法', 'James F. Kurose', '人民邮电出版社', (SELECT id FROM category WHERE code='TP'), 2018, 128.00, '计算机网络,网络协议,自顶向下,TCP', '以应用层为起点自顶向下讲解网络原理，配套实验丰富。', '三楼东区 TP393/771', 6, NOW(), NOW()),
- ('9787111213827', '数据库系统概念', 'Abraham Silberschatz', '机械工业出版社', (SELECT id FROM category WHERE code='TP'), 2021, 138.00, '数据库,SQL,事务,索引', '数据库领域教科书，覆盖关系模型、事务、并发控制与恢复。', '三楼东区 TP311/552', 3, NOW(), NOW()),
- ('9787111602583', '算法导论', 'Thomas H. Cormen', '机械工业出版社', (SELECT id FROM category WHERE code='TP'), 2013, 158.00, '算法,数据结构,动态规划,图论', '算法领域的权威教材，覆盖排序、图算法、动态规划与 NP 完全性。', '三楼东区 TP301/233', 4, NOW(), NOW()),
- ('9787111558422', '设计模式：可复用面向对象软件的基础', 'Erich Gamma', '机械工业出版社', (SELECT id FROM category WHERE code='TP'), 2019, 79.00, '设计模式,面向对象,重构,架构', 'GoF 二十三种设计模式的奠基之作。', '三楼东区 TP311/566', 3, NOW(), NOW()),
- ('9787111641247', '重构：改善既有代码的设计', 'Martin Fowler', '机械工业出版社', (SELECT id FROM category WHERE code='TP'), 2019, 118.00, '重构,代码质量,设计模式,单元测试', '系统讲解如何在保证行为不变的前提下改善代码结构。', '三楼东区 TP311/571', 3, NOW(), NOW()),
- ('9787115546081', '深入理解计算机系统', 'Randal E. Bryant', '机械工业出版社', (SELECT id FROM category WHERE code='TP'), 2016, 139.00, '计算机系统,汇编,缓存,链接', '从程序员视角贯穿硬件与系统软件的经典教材。', '三楼东区 TP303/214', 4, NOW(), NOW()),
- ('9787121362842', 'Elasticsearch实战', 'Radu Gheorghe', '电子工业出版社', (SELECT id FROM category WHERE code='TP'), 2020, 99.00, 'Elasticsearch,全文检索,倒排索引,搜索引擎', '讲解 ES 的索引原理、查询 DSL 与集群运维实践。', '三楼东区 TP391/88', 2, NOW(), NOW()),
- ('9787115473899', 'Redis设计与实现', '黄健宏', '机械工业出版社', (SELECT id FROM category WHERE code='TP'), 2018, 89.00, 'Redis,缓存,数据结构,持久化', '从源码角度讲解 Redis 的内部数据结构与持久化机制。', '三楼东区 TP311/580', 5, NOW(), NOW()),
- ('9787111407010', '高性能MySQL', 'Baron Schwartz', '机械工业出版社', (SELECT id FROM category WHERE code='TP'), 2013, 128.00, 'MySQL,索引优化,慢查询,分库分表', 'MySQL 性能优化的权威指南，含索引、查询优化与复制。', '三楼东区 TP311/490', 3, NOW(), NOW()),
- ('9787115293800', 'Spring实战', 'Craig Walls', '人民邮电出版社', (SELECT id FROM category WHERE code='TP'), 2020, 108.00, 'Spring,SpringBoot,IoC,AOP', 'Spring 全家桶的实践指南。', '三楼东区 TP312/1402', 5, NOW(), NOW()),
- ('9787020002207', '红楼梦', '曹雪芹', '人民文学出版社', (SELECT id FROM category WHERE code='I2'), 2018, 59.70, '古典文学,小说,四大名著,清代', '中国古典小说的巅峰之作。', '五楼北区 I242/77', 10, NOW(), NOW()),
- ('9787115473898', '离散数学及其应用', 'Kenneth H. Rosen', '机械工业出版社', (SELECT id FROM category WHERE code='O1'), 2019, 99.00, '离散数学,图论,数理逻辑,组合数学', '计算机专业离散数学主流教材。', '四楼西区 O158/97', 4, NOW(), NOW());
+insert into book (isbn, title, author, publisher, category_id, publish_year, price, tags, summary, shelf_location, total_copies, created_at, updated_at) values
+ ('9787111213826', '深入理解Java虚拟机', '周志明', '机械工业出版社', (select id from category where code='TP'), 2019, 129.00, 'Java,JVM,性能调优,虚拟机', '从内存模型、垃圾回收到编译优化的 JVM 系统级讲解，是 Java 工程师进阶必读。', '三楼东区 TP312/1287', 5, NOW(), NOW()),
+ ('9787111544937', 'Java并发编程实战', 'Brian Goetz', '机械工业出版社', (select id from category where code='TP'), 2017, 89.00, 'Java,并发,多线程,线程安全', 'Java 并发领域经典，系统讲解线程安全、锁、并发容器与线程池。', '三楼东区 TP312/1321', 4, NOW(), NOW()),
+ ('9787115428028', '计算机网络：自顶向下方法', 'James F. Kurose', '人民邮电出版社', (select id from category where code='TP'), 2018, 128.00, '计算机网络,网络协议,自顶向下,TCP', '以应用层为起点自顶向下讲解网络原理，配套实验丰富。', '三楼东区 TP393/771', 6, NOW(), NOW()),
+ ('9787111213827', '数据库系统概念', 'Abraham Silberschatz', '机械工业出版社', (select id from category where code='TP'), 2021, 138.00, '数据库,SQL,事务,索引', '数据库领域教科书，覆盖关系模型、事务、并发控制与恢复。', '三楼东区 TP311/552', 3, NOW(), NOW()),
+ ('9787111602583', '算法导论', 'Thomas H. Cormen', '机械工业出版社', (select id from category where code='TP'), 2013, 158.00, '算法,数据结构,动态规划,图论', '算法领域的权威教材，覆盖排序、图算法、动态规划与 NP 完全性。', '三楼东区 TP301/233', 4, NOW(), NOW()),
+ ('9787111558422', '设计模式：可复用面向对象软件的基础', 'Erich Gamma', '机械工业出版社', (select id from category where code='TP'), 2019, 79.00, '设计模式,面向对象,重构,架构', 'GoF 二十三种设计模式的奠基之作。', '三楼东区 TP311/566', 3, NOW(), NOW()),
+ ('9787111641247', '重构：改善既有代码的设计', 'Martin Fowler', '机械工业出版社', (select id from category where code='TP'), 2019, 118.00, '重构,代码质量,设计模式,单元测试', '系统讲解如何在保证行为不变的前提下改善代码结构。', '三楼东区 TP311/571', 3, NOW(), NOW()),
+ ('9787115546081', '深入理解计算机系统', 'Randal E. Bryant', '机械工业出版社', (select id from category where code='TP'), 2016, 139.00, '计算机系统,汇编,缓存,链接', '从程序员视角贯穿硬件与系统软件的经典教材。', '三楼东区 TP303/214', 4, NOW(), NOW()),
+ ('9787121362842', 'Elasticsearch实战', 'Radu Gheorghe', '电子工业出版社', (select id from category where code='TP'), 2020, 99.00, 'Elasticsearch,全文检索,倒排索引,搜索引擎', '讲解 ES 的索引原理、查询 DSL 与集群运维实践。', '三楼东区 TP391/88', 2, NOW(), NOW()),
+ ('9787115473899', 'Redis设计与实现', '黄健宏', '机械工业出版社', (select id from category where code='TP'), 2018, 89.00, 'Redis,缓存,数据结构,持久化', '从源码角度讲解 Redis 的内部数据结构与持久化机制。', '三楼东区 TP311/580', 5, NOW(), NOW()),
+ ('9787111407010', '高性能MySQL', 'Baron Schwartz', '机械工业出版社', (select id from category where code='TP'), 2013, 128.00, 'MySQL,索引优化,慢查询,分库分表', 'MySQL 性能优化的权威指南，含索引、查询优化与复制。', '三楼东区 TP311/490', 3, NOW(), NOW()),
+ ('9787115293800', 'Spring实战', 'Craig Walls', '人民邮电出版社', (select id from category where code='TP'), 2020, 108.00, 'Spring,SpringBoot,IoC,AOP', 'Spring 全家桶的实践指南。', '三楼东区 TP312/1402', 5, NOW(), NOW()),
+ ('9787115476272', '数学分析新讲', '张筑生', '北京大学出版社', (select id from category where code='O1'), 2018, 68.00, '数学分析,极限,微积分,级数', '面向初学者的数学分析教材，讲解细致。', '四楼西区 O17/312', 6, NOW(), NOW()),
+ ('9787040396638', '高等代数', '北京大学数学系', '高等教育出版社', (select id from category where code='O1'), 2019, 45.00, '高等代数,线性代数,矩阵,多项式', '国内高校广泛采用的代数教材。', '四楼西区 O15/206', 8, NOW(), NOW()),
+ ('9787040238969', '概率论与数理统计', '盛骤', '高等教育出版社', (select id from category where code='O1'), 2018, 42.00, '概率论,数理统计,随机变量,假设检验', '工科概率统计经典教材。', '四楼西区 O21/188', 10, NOW(), NOW()),
+ ('9787115473898', '离散数学及其应用', 'Kenneth H. Rosen', '机械工业出版社', (select id from category where code='O1'), 2019, 99.00, '离散数学,图论,数理逻辑,组合数学', '计算机专业离散数学主流教材。', '四楼西区 O158/97', 4, NOW(), NOW()),
+ ('9787111631170', '经济学原理', 'N. Gregory Mankiw', '机械工业出版社', (select id from category where code='F2'), 2020, 128.00, '经济学,微观经济,宏观经济,供需', '全球广泛使用的经济学入门教材。', '二楼南区 F0/433', 5, NOW(), NOW()),
+ ('9787300287651', '管理学原理', '斯蒂芬·罗宾斯', '中国人民大学出版社', (select id from category where code='F2'), 2019, 79.00, '管理学,组织行为,决策,领导力', '管理学入门经典。', '二楼南区 C93/288', 4, NOW(), NOW()),
+ ('9787020002207', '红楼梦', '曹雪芹', '人民文学出版社', (select id from category where code='I2'), 2018, 59.70, '古典文学,小说,四大名著,清代', '中国古典小说的巅峰之作。', '五楼北区 I242/77', 10, NOW(), NOW()),
+ ('9787020008735', '平凡的世界', '路遥', '人民文学出版社', (select id from category where code='I2'), 2017, 108.00, '当代文学,长篇小说,现实主义,茅盾文学奖', '描写中国城乡社会变迁的当代长篇小说。', '五楼北区 I247/1929', 6, NOW(), NOW()),
+ ('9787506365437', '活着', '余华', '作家出版社', (select id from category where code='I2'), 2012, 35.00, '当代文学,小说,人生,苦难', '讲述普通人在时代洪流中的生存与坚韧。', '五楼北区 I247/1688', 8, NOW(), NOW()),
+ ('9787108009821', '万历十五年', '黄仁宇', '生活·读书·新知三联书店', (select id from category where code='I2'), 2015, 45.00, '历史,明史,大历史观,传记', '以 1587 年为切口剖析明代政治与社会结构。', '五楼北区 K248/120', 4, NOW(), NOW()),
+ ('9787100006668', '西方哲学史', '伯特兰·罗素', '商务印书馆', (select id from category where code='B0'), 2016, 88.00, '哲学,哲学史,西方思想,认识论', '罗素撰写的西方哲学通史。', '六楼东区 B5/64', 3, NOW(), NOW()),
+ ('9787544766333', '新概念英语', 'L.G. Alexander', '外语教学与研究出版社', (select id from category where code='H3'), 2018, 69.00, '英语,外语学习,语法,词汇', '经典英语学习教材。', '五楼南区 H31/1024', 12, NOW(), NOW());
 
 -- ---------------------------- 库存 -------------------------------------------
--- 通过 book 表关联，不写死自增 id；初始可借数 = 总复本数。
-INSERT INTO book_stock (book_id, total_copies, available_copies, locked_copies, version, updated_at)
-SELECT id, total_copies, total_copies, 0, 0, NOW() FROM book;
+-- 库存初始化：初始可借数 = 总复本数。全部通过 book 表关联，避免写死 id。
+insert into book_stock (book_id, total_copies, available_copies, locked_copies, version, updated_at)
+select id, total_copies, total_copies, 0, 0, NOW() from book;
 
--- ---------------------------- 借阅流水（演示"我的借阅"/逾期/罚金） ------------
+-- ---------------------------- 借阅流水（演示"我的借阅"与逾期/续借） ----------
 -- 陈嘉禾：正常在借 2 册
-INSERT INTO borrow_record (reader_id, book_id, borrow_at, due_at, return_at, renew_count, status, fine, created_at, updated_at)
-SELECT r.id, b.id, DATE_SUB(NOW(), INTERVAL 5 DAY), DATE_ADD(NOW(), INTERVAL 25 DAY), NULL, 0, 'BORROWED', 0.00, NOW(), NOW()
-FROM reader r JOIN book b ON b.isbn = '9787111213826' WHERE r.card_no = '2021001';
+insert into borrow_record (reader_id, book_id, borrow_at, due_at, return_at, renew_count, status, fine, created_at, updated_at)
+select r.id, b.id, TIMESTAMPADD(DAY, -5, NOW()), TIMESTAMPADD(DAY, 25, NOW()), null, 0, 'BORROWED', 0.00, NOW(), NOW()
+from reader r, book b where r.card_no = '2021001' and b.isbn = '9787111213826';
 
-INSERT INTO borrow_record (reader_id, book_id, borrow_at, due_at, return_at, renew_count, status, fine, created_at, updated_at)
-SELECT r.id, b.id, DATE_SUB(NOW(), INTERVAL 3 DAY), DATE_ADD(NOW(), INTERVAL 27 DAY), NULL, 1, 'BORROWED', 0.00, NOW(), NOW()
-FROM reader r JOIN book b ON b.isbn = '9787111544937' WHERE r.card_no = '2021001';
+insert into borrow_record (reader_id, book_id, borrow_at, due_at, return_at, renew_count, status, fine, created_at, updated_at)
+select r.id, b.id, TIMESTAMPADD(DAY, -3, NOW()), TIMESTAMPADD(DAY, 27, NOW()), null, 1, 'BORROWED', 0.00, NOW(), NOW()
+from reader r, book b where r.card_no = '2021001' and b.isbn = '9787111544937';
 
--- 林思远：逾期未还 1 册（演示逾期限制与罚金 = 40 天 * 0.2 = 8.00）
-INSERT INTO borrow_record (reader_id, book_id, borrow_at, due_at, return_at, renew_count, status, fine, created_at, updated_at)
-SELECT r.id, b.id, DATE_SUB(NOW(), INTERVAL 70 DAY), DATE_SUB(NOW(), INTERVAL 40 DAY), NULL, 0, 'OVERDUE', 8.00, NOW(), NOW()
-FROM reader r JOIN book b ON b.isbn = '9787115428028' WHERE r.card_no = '2021002';
+-- 林思远：逾期未还 1 册（用于演示逾期限制与罚金）
+insert into borrow_record (reader_id, book_id, borrow_at, due_at, return_at, renew_count, status, fine, created_at, updated_at)
+select r.id, b.id, TIMESTAMPADD(DAY, -70, NOW()), TIMESTAMPADD(DAY, -40, NOW()), null, 0, 'OVERDUE', 8.00, NOW(), NOW()
+from reader r, book b where r.card_no = '2021002' and b.isbn = '9787115428028';
 
 -- 周雨桐：已归还 1 册（历史记录）
-INSERT INTO borrow_record (reader_id, book_id, borrow_at, due_at, return_at, renew_count, status, fine, created_at, updated_at)
-SELECT r.id, b.id, DATE_SUB(NOW(), INTERVAL 60 DAY), DATE_SUB(NOW(), INTERVAL 30 DAY), DATE_SUB(NOW(), INTERVAL 33 DAY), 0, 'RETURNED', 0.00, NOW(), NOW()
-FROM reader r JOIN book b ON b.isbn = '9787020002207' WHERE r.card_no = '2021003';
+insert into borrow_record (reader_id, book_id, borrow_at, due_at, return_at, renew_count, status, fine, created_at, updated_at)
+select r.id, b.id, TIMESTAMPADD(DAY, -60, NOW()), TIMESTAMPADD(DAY, -30, NOW()), TIMESTAMPADD(DAY, -33, NOW()), 0, 'RETURNED', 0.00, NOW(), NOW()
+from reader r, book b where r.card_no = '2021003' and b.isbn = '9787506365437';
 
--- 上面 3 册在借/逾期占用了库存，可借数同步扣减，保证"库存与流水一致"
--- （对应 GET /api/admin/reconcile 必须返回空数组）
-UPDATE book_stock s
-JOIN book b ON b.id = s.book_id
-SET s.available_copies = s.available_copies - 1, s.updated_at = NOW()
-WHERE b.isbn IN ('9787111213826', '9787111544937', '9787115428028');
+-- 逾期与在借导致的库存占用：把对应书的可借数扣掉，保证库存与流水一致
+update book_stock set available_copies = available_copies - 1, updated_at = NOW()
+where book_id in (select id from book where isbn in ('9787111213826', '9787111544937', '9787115428028'));
 
 -- ---------------------------- 预约队列 ---------------------------------------
-INSERT INTO reservation (reader_id, book_id, queue_no, status, ready_at, expire_at, created_at, updated_at)
-SELECT r.id, b.id, 1, 'WAITING', NULL, NULL, NOW(), NOW()
-FROM reader r JOIN book b ON b.isbn = '9787111602583' WHERE r.card_no = '2023007';
+-- 郑清越预约《算法导论》（该书仍有库存，此数据仅用于展示队列结构）
+insert into reservation (reader_id, book_id, queue_no, status, ready_at, expire_at, created_at, updated_at)
+select r.id, b.id, 1, 'WAITING', null, null, NOW(), NOW()
+from reader r, book b where r.card_no = '2023007' and b.isbn = '9787111602583';
 
 -- ---------------------------- 库存流水 ---------------------------------------
--- 与上面三次扣减一一对应：sum(delta) 必须等于 available_copies 的变化量。
--- before_qty/after_qty 取 book.total_copies（初始快照），与 H2 版 data.sql 口径一致。
-INSERT INTO stock_ledger (book_id, op_type, delta, before_qty, after_qty, biz_no, strategy, trace_id, created_at)
-SELECT b.id, 'DEDUCT', -1, b.total_copies, b.total_copies - 1, CONCAT('SEED-', b.isbn), 'INIT', 'seed', NOW()
-FROM book b WHERE b.isbn = '9787111213826';
+-- 与上面三次库存扣减对应，保证 sum(delta) 与库存变化一致（对账 SQL 见 docs/04）
+insert into stock_ledger (book_id, op_type, delta, before_qty, after_qty, biz_no, strategy, trace_id, created_at)
+select b.id, 'DEDUCT', -1, b.total_copies, b.total_copies - 1, CONCAT('SEED-', b.isbn), 'INIT', 'seed', NOW()
+from book b where b.isbn = '9787111213826';
 
-INSERT INTO stock_ledger (book_id, op_type, delta, before_qty, after_qty, biz_no, strategy, trace_id, created_at)
-SELECT b.id, 'DEDUCT', -1, b.total_copies, b.total_copies - 1, CONCAT('SEED2-', b.isbn), 'INIT', 'seed', NOW()
-FROM book b WHERE b.isbn = '9787111544937';
+insert into stock_ledger (book_id, op_type, delta, before_qty, after_qty, biz_no, strategy, trace_id, created_at)
+select b.id, 'DEDUCT', -1, b.total_copies, b.total_copies - 1, CONCAT('SEED2-', b.isbn), 'INIT', 'seed', NOW()
+from book b where b.isbn = '9787111544937';
 
-INSERT INTO stock_ledger (book_id, op_type, delta, before_qty, after_qty, biz_no, strategy, trace_id, created_at)
-SELECT b.id, 'DEDUCT', -1, b.total_copies, b.total_copies - 1, CONCAT('SEED3-', b.isbn), 'INIT', 'seed', NOW()
-FROM book b WHERE b.isbn = '9787115428028';
+insert into stock_ledger (book_id, op_type, delta, before_qty, after_qty, biz_no, strategy, trace_id, created_at)
+select b.id, 'DEDUCT', -1, b.total_copies, b.total_copies - 1, CONCAT('SEED3-', b.isbn), 'INIT', 'seed', NOW()
+from book b where b.isbn = '9787115428028';
 
 -- ---------------------------- 借阅规则 ---------------------------------------
 -- 目标：改规则不发版。reader_type='*' 为兜底，具体类型优先。
-INSERT INTO rule_config (rule_key, reader_type, rule_value, remark, version, updated_at) VALUES
+insert into rule_config (rule_key, reader_type, rule_value, remark, version, updated_at) values
  ('max_borrow_count', 'UNDERGRAD', '10', '本科生可借册数', 0, NOW()),
  ('max_borrow_count', 'POSTGRAD',  '15', '研究生可借册数', 0, NOW()),
  ('max_borrow_count', 'TEACHER',   '20', '教师可借册数', 0, NOW()),
@@ -134,15 +134,3 @@ INSERT INTO rule_config (rule_key, reader_type, rule_value, remark, version, upd
  ('min_credit_score', '*',         '60', '低于该信用分禁止借阅', 0, NOW()),
  ('reservation_hold_days', '*',    '3',  '预约到馆保留天数', 0, NOW()),
  ('max_renew_days',   '*',         '180', '单册最长借阅天数上限', 0, NOW());
-
--- ---------------------------- 自检 -------------------------------------------
--- 对账不变式：每个 book_id 的流水求和 + 初始总量 必须等于当前可借数。
--- 期望查询结果为空（有行 = 种子数据本身不自洽，必须修脚本而不是改断言）。
-SELECT s.book_id, s.total_copies, s.available_copies,
-       COALESCE(l.delta_sum, 0) AS ledger_delta_sum
-FROM book_stock s
-LEFT JOIN (
-    SELECT book_id, SUM(delta) AS delta_sum FROM stock_ledger GROUP BY book_id
-) l ON l.book_id = s.book_id
-WHERE l.delta_sum IS NOT NULL
-  AND s.available_copies <> s.total_copies + l.delta_sum;

@@ -87,33 +87,45 @@ class Plan:
         }
 
 
+#: 借书信号。**负向断言写在 Python 层而不是正则里**：
+#: `(?!.*续借)` 放在模式开头时，re.search 会从每个位置重新尝试，
+#: 从"借一下"那个位置看过去，"续借"已经被越过了 —— 断言就失效了（实测过）。
+_BORROW_SIGNAL = re.compile(r"(帮我借|我要借|替我借|借一下|借这本|借那本|把.{0,8}借给我)")
+
 #: 复合任务的特征词 → (工具, 说明)。顺序即执行顺序。
 _COMPOSITE_SIGNALS: tuple[tuple[re.Pattern[str], str, str], ...] = (
-    (re.compile(r"(帮我借|我要借|替我借|借一下|借这本|借那本)"), "borrow", "办理借阅"),
+    (_BORROW_SIGNAL, "borrow", "办理借阅"),
     (re.compile(r"(续借|延期)"), "renew", "办理续借"),
     (re.compile(r"(推荐|类似|相似|同类|好书)"), "recommend", "推荐同类图书"),
     (re.compile(r"(逾期|超期|还没还|未还)"), "my_loans", "查询逾期情况"),
-    (re.compile(r"(我借了|我的借阅|在借)"), "my_loans", "查询在借记录"),
+    (re.compile(r"(我借了|我的借阅|在借|借阅)"), "my_loans", "查询在借记录"),
     (re.compile(r"(信用分|我的额度|能借几本|我的权限)"), "get_reader_profile", "查询借阅额度"),
 )
 
 
 def detect_composite(message: str) -> list[str]:
     """检测一条消息里包含几件事，返回按出现顺序去重后的工具序列。"""
+    text = message or ""
     tools: list[str] = []
     for pattern, tool, _desc in _COMPOSITE_SIGNALS:
-        if pattern.search(message or "") and tool not in tools:
+        if tool == "borrow" and "续借" in text:
+            # "把…续借一下" / "续借一下" 里的"借"不是借新书
+            continue
+        if pattern.search(text) and tool not in tools:
             tools.append(tool)
     return tools
 
 
 def is_composite(message: str) -> bool:
-    """是否属于需要多步编排的复合任务（≥2 件事，或"借书"这种带依赖的写操作）。"""
-    tools = detect_composite(message)
-    if len(tools) >= 2:
-        return True
-    # 单独的借书也需要多步：先查可借复本 → 再借
-    return tools == ["borrow"]
+    """是否属于需要多步编排的复合任务。
+
+    判据是"**至少两件不同的事**"，不是"有任意一件事"。
+    曾经写成 `bool(detect_composite(...))`，结果单句"帮我借《X》"也走 plan 分支，
+    而 plan 分支会先补一次 get_stock —— 于是同一句借书请求在两条代码路径上
+    行为不一致，并且把"书查不到"时该有的诚实答复覆盖成了无意义的确认回执。
+    单步写操作的库存前置核验统一交给 `AgentRuntime._ensure_book_evidence`。
+    """
+    return len(detect_composite(message)) >= 2
 
 
 class Planner:
@@ -219,7 +231,18 @@ class Planner:
 
         if not steps:
             return None
-        return Plan(goal=message.strip()[:60], steps=steps, source="rule")
+        # 去掉重复的工具步骤：我的借阅记录一次调用就能拿到全部记录，
+        # 排两步只会让工具被调两次、答案里同一份数据出现两遍（实测踩过）。
+        # 保留第一次出现的位置，其余按原顺序过滤。
+        deduped: list[Step] = []
+        seen: set[str] = set()
+        for step in steps:
+            if step.tool in seen:
+                continue
+            seen.add(step.tool)
+            step.index = len(deduped) + 1
+            deduped.append(step)
+        return Plan(goal=message.strip()[:60], steps=deduped, source="rule")
 
     # ---------------- LLM 拆解 ----------------
     async def _plan_by_llm(self, message: str, slots: dict[str, Any]) -> Plan | None:

@@ -80,7 +80,7 @@ class RenewTool(Tool):
                 code=reason or "RENEW_REJECTED",
             )
 
-        new_due = data.get("newDueDate") or data.get("new_due_date")
+        new_due = data.get("newDueDate") or data.get("newDueAt") or data.get("new_due_date")
         return ToolResult(
             ok=True,
             tool=self.name,

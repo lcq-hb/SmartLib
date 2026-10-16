@@ -16,9 +16,10 @@ deploy/
 ├── nginx/
 │   └── nginx.conf                     Nginx 入口配置（http 上下文片段，挂到 conf.d）
 ├── sql/
-│   ├── 01-schema.sql                  表结构（与 backend/src/main/resources/db/schema.sql 同步）
-│   ├── 02-seed.sql                    MySQL 版演示种子数据（14 本书 + 11 位读者 + 1 条逾期）
+│   ├── 01-schema.sql                  表结构（与 backend/src/main/resources/db/schema.sql 逐条一致）
+│   ├── 02-seed.sql                    初始化数据（与 backend/.../db/data.sql 逐条一致）
 │   ├── mysql-production-extras.sql    生产增量优化：ngram 全文索引(Q4)/分区/账号权限/慢查询
+│   ├── README.md                      SQL 目录约定（漂移规则、可移植语法子集、命令）
 │   └── generated/                     gen_books.py 的输出目录（已 gitignore，含 .gitkeep）
 ├── k8s/                               Kubernetes 清单（kustomize 组织）
 │   ├── namespace.yaml                 smartlib 命名空间（Pod Security: restricted）
@@ -99,19 +100,26 @@ Invoke-RestMethod http://127.0.0.1:8080/api/admin/reconcile
 ```powershell
 # 后端已在 8080 跑起来后
 powershell -ExecutionPolicy Bypass -File scripts/bench/run_all.ps1 `
-    -BaseUrl http://localhost:8080 -BookId 5 -Threads 50 -Requests 300
+    -BaseUrl http://localhost:8080 -CopiesPerRound 8 -Cycles 5
 ```
+
+参数含义：`-CopiesPerRound` = 每轮借出多少册（也就是每轮请求数），`-Cycles` = 每种策略跑多少轮；
+每策略样本量 = `CopiesPerRound × Cycles`。默认值在演示库（24 书目、最多 12 复本）上跑得比较合适。
 
 产物（都在 `scripts/bench/results/`）：
 
-| 文件 | 内容 |
-|---|---|
-| `summary.md` | 汇总 Markdown 表格（每个方案一行：并发/QPS/P50/P90/P99/错误率/成功数/超卖数/召回率）+ 对账结果 + 口径与限制 |
-| `borrow_<strategy>.json` | 六种策略各自的原始压测数据 |
-| `search_like.json` / `search_inverted-index.json` | 两个引擎的检索压测数据（含实测引擎名） |
-| `recall_like.json` / `recall_inverted-index.json` | 两个引擎的召回率明细（逐条 query 命中情况） |
-| `reconcile.json` | 对账接口原始响应 |
-| `notes.txt` | 跳过的步骤与失败原因（如管理端点未开启） |
+| 文件 | 内容 | 是否入库 |
+|---|---|---|
+| `summary.md` | 汇总报告：有效性前提 + 读者池筛选 + 六策略表 + **逐轮明细** + 检索表 + 召回率表 + 逐阶段对账 + 复现说明 + 已知问题 | ✅ 入库（唯一证据快照） |
+| `borrow_<strategy>.json` | 六种策略各自的原始压测数据（含逐轮 stockBefore/After/Return） | ❌ `*.json` 被 gitignore |
+| `search_like.json` / `search_inverted-index.json` | 两个引擎的检索压测数据（含实测引擎名） | ❌ |
+| `recall_like.json` / `recall_inverted-index.json` | 两个引擎的召回率明细（逐条 query 命中情况） | ❌ |
+| `reconcile.json` | 收尾对账原始响应 | ❌ |
+| `notes.txt` | 跳过的步骤与失败原因（如管理端点未开启） | ❌ |
+
+> **`结果文件` 列怎么用**：因为 `*.json` 不入库，表里那一列**不能**用来"打开文件核对数字"，
+> 它只是本次运行的产物名。要复核只能**重跑**——`summary.md` 里给了完整复现命令。
+> 换句话说：`summary.md` 是随仓库走的证据，JSON 是本机中间产物。
 
 `summary.md` 只写**实测值**，不写目标值；数字旁边永远跟着口径与限制说明。
 
@@ -137,22 +145,44 @@ python scripts/bench/search_bench.py --url http://localhost:8080 `
     --out scripts/bench/results/recall_inverted-index.json
 ```
 
+### 3.3 测量设计：为什么每轮都要重置库存（v2 的关键改动）
+
+`run_all.ps1` 的第一版有一个**测量设计缺陷**：六种策略依次压**同一本书**，第一轮就把复本借光了，
+后面几轮的失败原因是「库存没了 / 同一读者重复借」——于是那张「六策略对比表」里的
+QPS/P99 测的其实是**业务规则拒绝的速度**，策略之间根本不可比。v2 的修法：
+
+| 问题 | v2 的做法 |
+|---|---|
+| 各轮共享库存 | **每轮回借出后立即归还**：`POST /api/borrows/{id}/return`（纯公开 API，不改后端），库存回到该轮初始值。逐轮证据写入 `summary.md` 表 2 的 `借前/借后/归还后` 三列 |
+| 读者池被污染 | 预筛读者：`GET /api/readers/{id}/credit` + `/loans`，排除信用分 < `min_credit_score`、有逾期、有欠费、非 ACTIVE 的读者；筛选结果与排除原因都写进 `summary.md` |
+| 期望值说不清 | 每轮期望成功数 = `min(该轮可借复本数, 本轮请求数, 干净读者数)`；目标书选「复本数 ≤ 干净读者数」的书，这样每轮能**恰好借空**：成功数少了 = 误拒，多了 = 超卖 |
+| 库存判据读缓存 | 一律读**权威源** `GET /internal/agent/tools/books/{id}/stock`（HMAC 签名，直读库）。原因见第 8 节已知问题 15：`GET /api/books/{id}` 的缓存不会随库存变化失效 |
+| 只给一条全局对账 | 每种策略跑完都调一次 `GET /api/admin/reconcile`，逐阶段记录结论与 violations |
+
+`load_borrow.py` 的对应参数：`--cycles N`、`--return-each-cycle`、`--reader-mode distinct`。
+不加 `--return-each-cycle` 时，多轮会被 CLI 直接拒绝（必须显式 `--allow-unreset-stock`），
+避免"不小心跑出不可比数据"。
+
 退出码约定（便于脚本判定）：
 
 | 退出码 | 含义 |
 |---|---|
 | 0 | 正常完成 |
-| 2 | 参数错误 |
-| 3 | **发生超卖**（`load_borrow.py`：压测后 `availableCopies < 0`） |
+| 2 | 参数错误（含"多轮但没开 `--return-each-cycle`"） |
+| 3 | **发生超卖**或**扣减不守恒**（`availableCopies < 0`，或 `扣减后可借 ≠ 扣减前可借 - 成功数`） |
 | 4 | 全部请求失败（后端没起来 / 地址写错） |
+| 5 | 期望成功数与实测不一致，或某轮结束后库存没复原 |
 
-### 3.3 召回率口径（必须和数字一起看）
+### 3.4 召回率口径（必须和数字一起看）
 
 - 数据集每条是 `{"query": "...", "expected_book_ids": [1, 2]}`，期望 id 取自
-  `backend/src/main/resources/db/data.sql` 里**真实存在**的 24 本书。
-- 单条召回率 = `|命中 ∩ 期望| / |期望|`；平均召回率 = 各条平均。
-- 期望集是"至少应被召回"的人工小集合，不是完整相关文档集合 → 属**可用性召回**，
-  不能当学术意义的 recall 用。这一点在 `summary.md` 和 JSON 里都写了。
+  `backend/src/main/resources/db/data.sql` 里**真实存在**的 24 本书（覆盖全部 24 本、共 42 条查询）。
+- **两个指标必须分清**（`summary.md` 表 4 已拆成两列，不要混着念）：
+  - **平均召回率** = 对每条查询 `|命中期望 id| / |期望 id|` 再取平均 → 衡量「找全了没有」；
+  - **Top1 命中率** = 期望 id 出现在**第一条**结果里的查询占比 → 衡量「排第一的对不对」。
+- 期望集是「至少应被召回」的人工**小集合**，不是完整相关文档集合 → 属**可用性召回**，
+  不能当学术意义的 recall 用。这句话在 `search_bench.py` 的 `evaluate_recall` docstring、
+  `summary.md` 与本节里是**同一口径**。
 - `expected_book_ids` 为空的条目（负样本）**不计入分母**，会在 JSON 的
   `recall.skippedEntries` 里体现，避免人为拉低/拉高召回率。
 
@@ -322,12 +352,22 @@ docker run --rm -v "$PWD/deploy/nginx:/etc/nginx/conf.d:ro" nginx:1.27-alpine ng
    根目录变体的正确形式：在根目录放 Dockerfile 副本，compose 写
    `build: { context: ., dockerfile: Dockerfile.backend }`，两处 `COPY` 路径不变。
 
-2. **全部 Docker / K8s / Nginx 产物都没有实际启动验证过。**
-   本机没有 Docker（`docker` 不在 PATH），也没有可用的 K8s 集群。
-   已验证的部分只有：YAML 全部能被 `yaml.safe_load_all` 解析、nginx.conf 花括号配对与
-   关键指令存在性、PowerShell 脚本能被 PS 5.1 的 `Parser::ParseFile` 无错解析、
-   Python 脚本实际跑过（含生成 200 条数据与对不可达端口压测的错误路径）。
-   **"能解析"不代表"能跑起来"**：首次 `docker compose up` / `kubectl apply -k` 时请预留排错时间。
+2. **Docker / K8s / Nginx 产物没有实际启动验证过**（本机没有 Docker，也没有 K8s 集群）。
+   已验证与未验证的部分要分清楚：
+
+   | 项目 | 状态 |
+   |---|---|
+   | 17 个 YAML（compose + k8s + CI）| ✅ 全部能 `yaml.safe_load_all` 解析；关键字段（副本数、滚动策略、探针、preStop、HPA 阈值、端口映射、healthcheck）逐条断言通过 |
+   | `nginx.conf` | ✅ 花括号配对、无 `events`/`http` 外壳、关键指令（keepalive 32 / max_fails / 限流 / allow-deny / SSE 三件套 / server_tokens）存在性检查通过；❌ **没有用 `nginx -t` 真校验过**（需要 Docker） |
+   | `Dockerfile.*` | ✅ 结构检查通过（多阶段、非 root、exec 形式 ENTRYPOINT/CMD、EXPOSE、先 COPY 依赖）；❌ **镜像从未构建过** |
+   | `scripts/gen_books.py` | ✅ 真跑过：`--count 200`（样本已生成）、20 万条尺度的 ISBN 唯一性与校验位自检通过 |
+   | `scripts/bench/*.py` | ✅ 真跑过（对着真实后端 8091）：六策略借阅压测 + 双引擎检索压测 + 双引擎召回率，退出码与 JSON 产物均正常 |
+   | `scripts/bench/run_all.ps1` | ✅ 真跑过完整流程（PS 5.1），产出了 `summary.md`；❌ **从未用 Docker/Compose 起的后端跑过** |
+   | `scripts/start-local.ps1` | ✅ 真跑过：在 PS 5.1 下识别出 `mvn.ps1` 无 BOM 并走 fallback，成功把后端拉起（H2、`Started SmartLibApplication`、`Tomcat started on port 8091`） |
+   | `deploy/sql/01-schema.sql` + `02-seed.sql` | ✅ 真跑过：用 H2 2.4.240（`MODE=MySQL`）完整执行，行数与"库存/流水守恒、无负库存"不变式全部通过 |
+   | `.github/workflows/ci.yml` | ❌ 未在真实 GitHub Runner 上跑过（路径、action 版本、命令都是标准写法） |
+
+   **"能解析"不等于"能跑起来"**：首次 `docker compose up` / `kubectl apply -k` 时请预留排错时间。
 
 3. **镜像构建未验证**：`backend` 镜像从未构建过（本机无 Docker），
    `agent` 镜像还依赖 `agent-service/requirements.txt` 与 `agent-service/app/` 存在。
@@ -358,19 +398,74 @@ docker run --rm -v "$PWD/deploy/nginx:/etc/nginx/conf.d:ro" nginx:1.27-alpine ng
    本地用 `scripts/start-local.ps1`（已自动带上该参数），Compose 通过
    `SMARTLIB_ADMIN_ENABLED=true` 打开。生产环境应关闭或叠加鉴权（它能改库存策略、重建索引）。
 
-10. **`deploy/sql/01-schema.sql` 是 `backend/.../db/schema.sql` 的副本**：
-    MySQL 容器的 initdb 无法挂软链，只能放真实文件。
-    改表结构后必须同步（否则 MySQL 与 H2 两套环境的结构会漂移）：
-    `cp backend/src/main/resources/db/schema.sql deploy/sql/01-schema.sql`
+10. **`deploy/sql/01-schema.sql` 与 `02-seed.sql` 是应用侧 SQL 的副本，不允许漂移**
+    - 权威来源是 `backend/src/main/resources/db/schema.sql` 与 `db/data.sql`（应用启动时执行）；
+    - 部署侧两份由 `python scripts/tools/check_sql_sync.py` 强制校验逐条一致（CI 也会跑）；
+    - 两份 SQL 都只用 **H2 `MODE=MySQL` 与 MySQL 8.0 的交集语法**，因此两侧共用同一份内容，
+      不存在"H2 专用 / MySQL 专用"的差异。详细规则见 `deploy/sql/README.md`。
+    - 本次交付时实测过：把 `01-schema.sql` + `02-seed.sql` 用 H2 2.4.240
+      （连接串 `jdbc:h2:mem:...;MODE=MySQL;DATABASE_TO_LOWER=TRUE`，与 local profile 一致）
+      完整执行一遍，结果 24 书目 / 24 库存 / 12 读者 / 6 分类 / 4 借阅流水 / 1 预约 /
+      3 库存流水 / 17 规则；负库存 0 行、对账违规 0 行。
+    - 顺带修掉一个真实缺陷：早期 `01-schema.sql` 末尾有一句
+      `ALTER DATABASE smartlib CHARACTER SET ...`，MySQL 接受但 **H2 直接语法报错**，
+      会让 H2 环境初始化失败。已删除，字符集改由容器启动参数与建库语句保证。
 
 11. **K8s 里的 Nginx**：`deploy/k8s/` 没有为 Nginx 单独建 Deployment —— K8s 环境用
     Ingress 承担入口职责（等价于 Compose 里 Nginx 的角色）。两套入口配置需要各自维护，
     改限流/超时策略时要**两边都改**（对照表见第 6 节）。
 
-12. **PowerShell 脚本编码**：`scripts/bench/run_all.ps1` 含中文输出，保存为
-    **UTF-8 with BOM**。PowerShell 5.1 在没有 BOM 时会按 ANSI 代码页读文件，
-    中文会变成乱码并可能直接导致解析失败（本次开发就踩了这个坑）。
-    `scripts/start-local.ps1` 刻意只写 ASCII 注释与输出，因此不依赖 BOM。
+12. **PowerShell 脚本编码（本次实际踩坑，必须读）**
+    PowerShell 5.1（Windows 自带）在**没有 UTF-8 BOM** 时按 ANSI 代码页读取 `.ps1`，
+    含中文的文件会直接解析失败（报"字符串缺少终止符 / Unexpected token"这类完全对不上号的错误）。
+    本目录交付的两个脚本按此规则处理：
+    - `scripts/start-local.ps1`：**纯 ASCII**（注释与输出都是英文），因此不依赖 BOM，最稳；
+    - `scripts/bench/run_all.ps1`：含中文输出，保存为 **UTF-8 with BOM**。
+      ⚠️ 用某些编辑器（或"另存为 UTF-8"）保存会**丢掉 BOM**，之后 PS 5.1 就会解析失败。
+      丢了就补回来（仓库根目录执行）：
+      ```bash
+      python -c "import io;p='scripts/bench/run_all.ps1';t=io.open(p,encoding='utf-8').read();io.open(p,'w',encoding='utf-8-sig',newline='').write(t)"
+      ```
+      或者改用 PowerShell 7 执行（`pwsh -File ...`）。
+
+13. **`scripts/mvn.ps1`（不属于本次交付范围）在 PS 5.1 下无法直接执行**
+    该文件含中文注释且**没有 UTF-8 BOM**，在 Windows PowerShell 5.1 下会被 ANSI 解码，
+    报 `Unexpected token ... / The string is missing the terminator`，Maven 根本起不来。
+    这不影响正确性，但会挡住"本地零依赖启动"这条路，所以 `start-local.ps1` 做了两件事：
+    - 启动前**检测**该文件是否"含非 ASCII 且无 BOM"并给出修复建议；
+    - 命中时自动改用**等价的 classworlds 直启**方式（与 `mvn.ps1` 内部实现一致：
+      用 `java` 直接跑 `plexus-classworlds` launcher，绕开 `mvn.cmd` 的 cmd.exe 代码页问题），
+      **不修改** `mvn.ps1` 本身。
+    根治方式二选一：给 `mvn.ps1` 加 UTF-8 BOM（见第 12 条的 Python 一行命令，路径换成 mvn.ps1），
+    或者用 PowerShell 7 跑所有脚本。
+
+14. **`/actuator/health` 在无 Redis 的机器上返回 503**
+    本地没有 Redis 时，`redis` 健康组件是 DOWN，整体 `status=DOWN`、HTTP 503，
+    但 `db` 是 UP、应用完全可用（库存策略会自动降级到 DB 条件更新）。
+    因此两个脚本的"等待就绪"判据都是：**HTTP 有响应 且 `components.db=UP`**，
+    并把非 UP 组件打印出来。若只用 `status == UP` 判断，本地压测会永远等不到后端。
+    K8s 里同理：`readinessProbe` 打 `/actuator/health/readiness`（probe 组只含
+    liveness/readiness 状态，不聚合外部依赖），所以 Redis 抖动不会把后端 Pod 摘出负载。
+
+15. **【后端缺陷·压测时实测确认】书目详情缓存不随库存变化失效 —— 需要后端同学修**
+    - **现象**：借出 8 册后立即 `GET /api/books/{id}`，`availableCopies` 仍返回**旧值**；
+      同一时刻内部签名接口 `GET /internal/agent/tools/books/{id}/stock` 返回正确值。
+      实测 30 个借阅轮次**每一轮**都复现（见 `summary.md` 表 2 的「借后可借 vs 缓存读数」两列）。
+    - **原因**：`BookService.getById` 走 `CacheGuard`（Caffeine L1 5min / Redis L2 30min），
+      而后端**唯一**的 `StockService.StockChangeListener` 实现是 `InvertedIndexSearchEngine`
+      （只更新倒排索引），**没有任何代码在库存变化时失效书目详情缓存**，只能等 TTL 到期自愈。
+    - **影响**：读者/前端看到的"可借数"会短暂偏大（本项目 P1 超卖叙事的直接相关面）。
+      **不影响扣减正确性**：`book_stock` 与 `stock_ledger` 守恒，逐阶段对账全部 PASS。
+    - **本目录的处理（不修改 `backend/`）**：压测脚本一律从内部签名接口取权威库存，
+      并把缓存读数单独列出来作对照；`load_borrow.py` 报告里会给出 `correctness.cacheStaleCycles`。
+    - **修复建议**：库存变更时同步失效 `smartlib:book:{id}`，或让 `BookView` 的库存字段
+      走更短 TTL/直读库存表。属于后端写路径，本次写入范围外。
+
+16. **PowerShell 的两个"字面量陷阱"（本目录脚本已按此规避，改脚本时注意）**
+    - PS 5.1 把 `“ ” ‘ ’`（中文弯引号）当作**引号定界符**，写在双引号字符串里会提前结束字符串。
+      本目录脚本已全部改用 「」 或 ASCII 单引号。
+    - 双引号字符串里想输出**一个反引号**必须写两个；写一个会被当转义符吞掉，
+      若紧邻结尾引号（例如 ``` 代码块围栏）还会把结尾引号一起吞掉，导致解析失败。
 
 ---
 

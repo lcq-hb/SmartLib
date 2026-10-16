@@ -108,6 +108,9 @@ class SearchBooksTool(Tool):
                 continue
             items.append(
                 {
+                    # 真实后端 search 返回的主键字段名是 `id`（联调实测：
+                    # {"id":5,"isbn":...,"title":"算法导论",...}），蓝图 §8.2 没写死
+                    # 这个字段名，所以三种写法都归一化，避免下游解析 book_id 落空。
                     "bookId": item.get("bookId") or item.get("book_id") or item.get("id"),
                     "title": item.get("title") or item.get("name") or "未知书名",
                     "author": item.get("author") or "",

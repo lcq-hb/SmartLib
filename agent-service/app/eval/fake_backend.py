@@ -21,9 +21,11 @@ from typing import Any
 import httpx
 
 #: 评测用书目表（book_id 与 mock LLM 的 KNOWN_BOOKS 对应）
+#: 评测用书目表。**键就是 book_id（后端主键语义）**，值里不再重复存 id。
+#: id 取真实后端风格的小数字（实测：算法导论=5、计算机网络=3），
+#: 这样“运行时到底用了哪个 id”才是可断言的。
 BOOKS: dict[int, dict[str, Any]] = {
-    101: {
-        "bookId": 101,
+    5: {
         "title": "算法导论",
         "author": "Thomas H. Cormen",
         "publisher": "机械工业出版社",
@@ -34,8 +36,7 @@ BOOKS: dict[int, dict[str, Any]] = {
         "totalCopies": 5,
         "shelfLocation": "3 楼中文科技图书区 TP301.6/C822",
     },
-    102: {
-        "bookId": 102,
+    3: {
         "title": "计算机网络",
         "author": "谢希仁",
         "publisher": "电子工业出版社",
@@ -46,8 +47,7 @@ BOOKS: dict[int, dict[str, Any]] = {
         "totalCopies": 4,
         "shelfLocation": "3 楼中文科技图书区 TP393/X475",
     },
-    103: {
-        "bookId": 103,
+    4: {
         "title": "高等数学",
         "author": "同济大学数学系",
         "publisher": "高等教育出版社",
@@ -58,8 +58,7 @@ BOOKS: dict[int, dict[str, Any]] = {
         "totalCopies": 10,
         "shelfLocation": "3 楼中文科技图书区 O13/T437",
     },
-    104: {
-        "bookId": 104,
+    6: {
         "title": "深入理解计算机系统",
         "author": "Randal E. Bryant",
         "publisher": "机械工业出版社",
@@ -70,8 +69,7 @@ BOOKS: dict[int, dict[str, Any]] = {
         "totalCopies": 6,
         "shelfLocation": "3 楼中文科技图书区 TP303/B915",
     },
-    105: {
-        "bookId": 105,
+    7: {
         "title": "Java 并发编程实战",
         "author": "Brian Goetz",
         "publisher": "机械工业出版社",
@@ -82,8 +80,7 @@ BOOKS: dict[int, dict[str, Any]] = {
         "totalCopies": 3,
         "shelfLocation": "3 楼中文科技图书区 TP312JA/G597",
     },
-    110: {
-        "bookId": 110,
+    12: {
         "title": "人类简史",
         "author": "尤瓦尔·赫拉利",
         "publisher": "中信出版社",
@@ -94,6 +91,17 @@ BOOKS: dict[int, dict[str, Any]] = {
         "totalCopies": 5,
         "shelfLocation": "4 楼中文文学与历史区 K02/H432",
     },
+    10: {
+        "title": "机器学习",
+        "author": "周志华",
+        "publisher": "清华大学出版社",
+        "publishYear": 2016,
+        "category": "计算机",
+        "callNumber": "TP181/Z785",
+        "availableCopies": 2,
+        "totalCopies": 8,
+        "shelfLocation": "3 楼中文科技图书区 TP181/Z785",
+    },
 }
 
 #: 读者借阅记录
@@ -101,7 +109,7 @@ LOANS: dict[int, list[dict[str, Any]]] = {
     1001: [
         {
             "borrowId": 5001,
-            "bookId": 101,
+            "bookId": 5,
             "title": "算法导论",
             "borrowAt": "2026-01-30",
             "dueDate": "2026-03-01",
@@ -113,7 +121,7 @@ LOANS: dict[int, list[dict[str, Any]]] = {
         },
         {
             "borrowId": 5002,
-            "bookId": 102,
+            "bookId": 3,
             "title": "计算机网络",
             "borrowAt": "2025-12-06",
             "dueDate": "2026-01-05",
@@ -127,7 +135,7 @@ LOANS: dict[int, list[dict[str, Any]]] = {
     1002: [
         {
             "borrowId": 6001,
-            "bookId": 103,
+            "bookId": 4,
             "title": "高等数学",
             "borrowAt": "2026-02-01",
             "dueDate": "2026-04-02",
@@ -198,6 +206,8 @@ class EvalBackend:
             book_id = self._int_from_path(path)
             book = BOOKS.get(book_id)
             if not book:
+                # 真实后端对不存在的书目返回业务失败 code=2002
+                # （系统走不到这里，因为 book_id 已由检索结果背书；保留它以覆盖异常路径）
                 return self._ok(None)
             return self._ok(
                 {
@@ -254,29 +264,33 @@ class EvalBackend:
             return self._ok({"answer": "", "source": ""})
         if path.endswith("/similar") and "/books/" in path:
             book_id = self._int_from_path(path)
-            seed = BOOKS.get(book_id) or BOOKS[101]
+            seed = BOOKS.get(book_id) or next(iter(BOOKS.values()))
             items = [
-                {k: v for k, v in b.items()}
+                self._as_item(bid, b)
                 for bid, b in BOOKS.items()
                 if bid != book_id and b["category"] == seed["category"]
             ]
             return self._ok(items[:3])
         if path == "/internal/agent/tools/books/hot":
-            return self._ok(
-                [
-                    {k: v for k, v in BOOKS[103].items()},
-                    {k: v for k, v in BOOKS[104].items()},
-                ]
-            )
+            return self._ok([self._as_item(4, BOOKS[4]), self._as_item(6, BOOKS[6])])
         return self._ok(None)
 
     # ---------------- 辅助 ----------------
+    @staticmethod
+    def _as_item(book_id: int, meta: dict[str, Any]) -> dict[str, Any]:
+        """把书目条目序列化成后端返回的形状（含 bookId）。
+
+        BOOKS 的键就是主键，值里不再重复存 id；这里在出口补回 bookId，
+        保证"工具结果里的 id 就是后端主键"这个语义成立。
+        """
+        return {"bookId": book_id, **meta}
+
     def _search(self, query: str) -> dict[str, Any]:
         keyword = (query or "").strip()
         if keyword:
             items = [
-                dict(book)
-                for book in BOOKS.values()
+                self._as_item(bid, book)
+                for bid, book in BOOKS.items()
                 if keyword in book["title"] or keyword in book["author"] or keyword in book["category"]
             ]
         else:
@@ -284,8 +298,8 @@ class EvalBackend:
         if not items and keyword:
             # 退一步做逐字匹配，模拟倒排索引的部分召回
             items = [
-                dict(book)
-                for book in BOOKS.values()
+                self._as_item(bid, book)
+                for bid, book in BOOKS.items()
                 if any(ch in book["title"] for ch in keyword if "\u4e00" <= ch <= "\u9fff")
             ][:3]
         return {

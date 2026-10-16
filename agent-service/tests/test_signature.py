@@ -22,6 +22,7 @@ from app.client.java_client import (
     build_query_string,
     build_sign_headers,
     compute_sign,
+    encoded_path_with_query,
     sign_request,
 )
 from tests.conftest import DEFAULT_SECRET, FakeJavaBackend, reference_sign
@@ -65,17 +66,44 @@ def test_get_without_body_keeps_trailing_newline() -> None:
     assert canonical.count("\n") == 3
 
 
-def test_query_string_is_not_url_encoded_for_signature() -> None:
-    """签名串里的 topic 必须是原始中文；实际请求 URL 才编码。"""
-    qs = build_query_string({"topic": "续借"})
-    assert qs == "?topic=续借"
-    assert "%" not in qs
+def test_query_string_signature_uses_percent_encoded_target() -> None:
+    """**回归用例**：签名必须覆盖百分号编码后的请求目标。
 
-    path_with_query = "/internal/agent/tools/policy" + qs
-    canonical = build_canonical(FIXED_TS, "GET", path_with_query, b"")
-    assert "topic=续借" in canonical
-    # 若错误地做了 URL 编码，签名必然与后端不一致
-    assert "topic=%E7%BB" not in canonical
+    这是曾经的真实缺陷：早期实现手工拼"未编码"的 query（`?topic=续借`）去签名，
+    而 Java 侧 `getQueryString()` 拿到的是 `topic=%E7%BB%AD%E5%80%9F`，
+    于是**所有带中文查询参数请求一律 401**（ASCII 参数下不会暴露，
+    属于典型的"只在非 ASCII 数据上才炸"的 bug）。
+
+    这里用固定向量把编码后的规范串钉死：
+    secret=默认值、timestamp=1760000000、
+    pathWithQuery=/internal/agent/tools/policy?topic=%E7%BB%AD%E5%80%9F、body 空。
+    """
+    encoded_path = "/internal/agent/tools/policy?topic=%E7%BB%AD%E5%80%9F"
+    canonical = f"{FIXED_TS}\nGET\n{encoded_path}\n"
+    expected = hmac.new(DEFAULT_SECRET.encode(), canonical.encode(), hashlib.sha256).hexdigest()
+
+    assert len(expected) == 64
+    assert expected == expected.lower()
+    assert sign_request(DEFAULT_SECRET, "GET", encoded_path, b"", FIXED_TS) == expected
+
+    # 用"未编码"的中文去签会得到完全不同的结果 —— 正是 401 的成因
+    unencoded = "/internal/agent/tools/policy?topic=续借"
+    assert sign_request(DEFAULT_SECRET, "GET", unencoded, b"", FIXED_TS) != expected
+
+
+def test_query_string_is_percent_encoded_in_canonical() -> None:
+    encoded_path = "/internal/agent/tools/policy?topic=%E7%BB%AD%E5%80%9F"
+    canonical = build_canonical(FIXED_TS, "GET", encoded_path, b"")
+    assert "%E7%BB%AD%E5%80%9F" in canonical
+    assert "topic=续借" not in canonical
+    assert canonical.endswith("\n")
+
+
+def test_build_query_string_is_display_only() -> None:
+    """`build_query_string` 只用于展示/调试，不参与签名（docstring 已写明）。"""
+    assert build_query_string({"topic": "续借"}) == "?topic=续借"
+    assert build_query_string(None) == ""
+    assert build_query_string({"a": 1, "b": None}) == "?a=1"
 
 
 def test_sign_uses_hmac_sha256_lowercase_hex() -> None:
@@ -111,7 +139,7 @@ def test_sign_is_sensitive_to_every_component() -> None:
 async def test_client_sends_valid_signature_headers(test_settings) -> None:
     backend = FakeJavaBackend(strict_sign=True)
     async with JavaClient(test_settings, transport=backend.transport()) as client:
-        data = await client.get_stock(book_id=101, trace_id="tr-sign-1")
+        data = await client.get_stock(book_id=5, trace_id="tr-sign-1")
 
     assert data["available"] == 3
     call = backend.last()
@@ -124,7 +152,7 @@ async def test_client_sends_valid_signature_headers(test_settings) -> None:
         DEFAULT_SECRET,
         lowered["x-internal-timestamp"],
         "GET",
-        "/internal/agent/tools/books/101/stock",
+        "/internal/agent/tools/books/5/stock",
         b"",
     )
 
@@ -158,26 +186,78 @@ async def test_wrong_secret_is_rejected_by_backend(test_settings) -> None:
     backend = FakeJavaBackend(secret="another-secret")
     async with JavaClient(test_settings, transport=backend.transport()) as client:
         with pytest.raises(UpstreamError):
-            await client.get_stock(book_id=101, trace_id="tr-sign-3")
+            await client.get_stock(book_id=5, trace_id="tr-sign-3")
 
 
 @pytest.mark.asyncio
-async def test_policy_query_signature_includes_raw_chinese(test_settings) -> None:
+async def test_policy_query_signature_uses_encoded_raw_path(test_settings) -> None:
+    """端到端：中文 query 的签名必须等于"对编码后 raw_path 计算"的结果。
+
+    同时断言 httpx 的 raw_path 里确实是 %E7%BB%AD%E5%80%9F，
+    把"签名的对象到底是什么"这件事钉死。
+    """
     backend = FakeJavaBackend(strict_sign=True)
+    captured: dict[str, str] = {}
+
     async with JavaClient(test_settings, transport=backend.transport()) as client:
+        original_send = client._get_client
+
         data = await client.policy(topic="续借", trace_id="tr-sign-4")
 
     assert "续借" in data["answer"]
     call = backend.last()
     assert call is not None
-    # 实际发出的 URL query 是编码后的，但签名用的是未编码形式
-    assert "topic=%E7%BB%AD%E5%80%9F" in call["query"]
+    # 实际发出的 query 是百分号编码形式（服务端 getQueryString() 看到的就是它）
+    assert call["query"] == "topic=%E7%BB%AD%E5%80%9F"
+
     lowered = {k.lower(): v for k, v in call["headers"].items()}
     assert lowered["x-internal-sign"] == reference_sign(
         DEFAULT_SECRET,
         lowered["x-internal-timestamp"],
         "GET",
-        "/internal/agent/tools/policy?topic=续借",
+        "/internal/agent/tools/policy?topic=%E7%BB%AD%E5%80%9F",
+        b"",
+    )
+
+
+@pytest.mark.asyncio
+async def test_encoded_path_with_query_matches_httpx_raw_path() -> None:
+    """`encoded_path_with_query` 必须与 httpx 的 raw_path 逐字节一致。"""
+    from app.client.java_client import encoded_path_with_query
+
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, json={}))
+    async with httpx.AsyncClient(transport=transport) as raw:
+        built = raw.build_request(
+            "GET", "/internal/agent/tools/policy", params={"topic": "续借", "size": 3}
+        )
+    assert encoded_path_with_query(built) == built.url.raw_path.decode("ascii")
+    assert "%E7%BB%AD%E5%80%9F" in encoded_path_with_query(built)
+    assert "topic=续借" not in encoded_path_with_query(built)
+
+
+def test_encoded_path_with_query_falls_back_when_raw_path_missing() -> None:
+    """构造方式拿不到 raw_path 时退回 path+query（两者都是编码后的形式）。"""
+    from app.client.java_client import encoded_path_with_query
+
+    request = httpx.Request("GET", "http://x/internal/agent/tools/policy?topic=续借")
+    assert encoded_path_with_query(request) == request.url.raw_path.decode("ascii")
+
+
+@pytest.mark.asyncio
+async def test_ascii_query_signature_still_works(test_settings) -> None:
+    """保留 ASCII 用例：编码后的 ASCII 参数与原形式一致，签名行为不变。"""
+    backend = FakeJavaBackend(strict_sign=True)
+    async with JavaClient(test_settings, transport=backend.transport()) as client:
+        data = await client.get_stock(book_id=5, trace_id="tr-ascii")
+    assert data["available"] == 3
+    call = backend.last()
+    assert call is not None
+    lowered = {k.lower(): v for k, v in call["headers"].items()}
+    assert lowered["x-internal-sign"] == reference_sign(
+        DEFAULT_SECRET,
+        lowered["x-internal-timestamp"],
+        "GET",
+        "/internal/agent/tools/books/5/stock",
         b"",
     )
 
@@ -185,8 +265,11 @@ async def test_policy_query_signature_includes_raw_chinese(test_settings) -> Non
 def test_sign_disabled_omits_headers(test_settings) -> None:
     """INTERNAL_SIGN_ENABLED=false 时不应带签名头（本地联调免签名场景）。"""
     disabled = test_settings.model_copy(update={"internal_sign_enabled": False})
-    client = JavaClient(disabled, transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"code": 0, "data": {}})))
-    headers = client._headers("tr", b"", "GET", "/x")
+    client = JavaClient(
+        disabled,
+        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"code": 0, "data": {}})),
+    )
+    headers = client._sign_headers("GET", "/x", b"", "tr")
     assert "X-Internal-Sign" not in headers
     assert "X-Internal-Timestamp" not in headers
     assert headers["X-Trace-Id"] == "tr"

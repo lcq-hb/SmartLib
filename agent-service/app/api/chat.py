@@ -21,7 +21,7 @@ from typing import Any, AsyncIterator
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
-from app.agent.runtime import AgentRuntime
+from app.agent.runtime import SCHEMA_VERSION, AgentRuntime
 from app.api.schemas import ChatRequest, ChatResponse
 
 router = APIRouter(tags=["chat"])
@@ -48,8 +48,13 @@ async def chat_sync(payload: ChatRequest, request: Request) -> ChatResponse:
         trace_id=trace_id,
     )
     request.state.trace_id = result.trace_id
-    request.app.state.record_trace(result.to_dict())
-    return ChatResponse(**result.to_dict())
+    result_dict = result.to_dict()
+    # 内部辅助步骤（为解析真实 book_id 而补的检索 / 库存核验）不进主响应：
+    # 前端展示"用过哪些工具"时会被它们干扰（"我问库存它怎么去检索了"）。
+    # 但**必须进 trace**，否则排查时看不到 book_id 是从哪来的。
+    request.app.state.record_trace({**result_dict, "schema_version": SCHEMA_VERSION})
+    result_dict.pop("internal_tool_calls", None)
+    return ChatResponse(**result_dict)
 
 
 @router.post("/chat")

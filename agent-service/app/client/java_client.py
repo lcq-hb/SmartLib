@@ -388,24 +388,6 @@ class JavaClient:
                 else:
                     await self.breaker.record_success()
                     return self._unwrap(resp, method, path)
-            except httpx.TimeoutException as exc:
-                last_error = UpstreamTimeoutError(f"{method} {path} 超时: {exc}")
-            except httpx.HTTPError as exc:
-                last_error = UpstreamError(f"{method} {path} 网络错误: {exc}")
-            else:
-                if resp.status_code >= 500:
-                    # 5xx 视为后端不健康：计入熔断，但仍按重试策略重试
-                    last_error = UpstreamError(f"{method} {path} 返回 {resp.status_code}")
-                elif resp.status_code >= 400:
-                    # 4xx 是契约/权限问题，重试没有意义，直接失败
-                    await self.breaker.record_failure()
-                    raise UpstreamError(
-                        f"{method} {path} 返回 {resp.status_code}",
-                        user_message=f"图书馆系统拒绝了这次请求（{resp.status_code}），请联系馆员。",
-                    )
-                else:
-                    await self.breaker.record_success()
-                    return self._unwrap(resp, method, path)
 
             # 走到这里说明本次尝试失败，按指数退避 + 抖动重试
             if attempt < attempts - 1:

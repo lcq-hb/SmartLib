@@ -89,13 +89,14 @@ class BorrowTool(Tool):
                 code=reason or "BORROW_REJECTED",
             )
 
-        due_date = data.get("dueDate") or data.get("due_date")
+        due_date = data.get("dueDate") or data.get("dueAt") or data.get("due_date")
         return ToolResult(
             ok=True,
             tool=self.name,
             data={
                 "borrowId": data.get("borrowId") or data.get("borrow_id"),
                 "dueDate": due_date,
+                "dueAt": data.get("dueAt"),
                 "reason": data.get("reason"),
             },
             summary=f"借阅成功，借阅记录号 {data.get('borrowId', '-')}，应还日期 {due_date}",

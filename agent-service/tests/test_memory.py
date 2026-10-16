@@ -131,12 +131,12 @@ def test_delete_and_clear() -> None:
 # =============================================================================
 def test_pending_action_roundtrip() -> None:
     session = Session(session_id="s")
-    session.set_pending("borrow", {"readerId": 1001, "bookId": 101})
+    session.set_pending("borrow", {"readerId": 1001, "bookId": 5})
     assert session.pending is not None
     action = session.pop_pending()
     assert action is not None
     assert action.tool == "borrow"
-    assert action.args["bookId"] == 101
+    assert action.args["bookId"] == 5
     # pop 之后必须被清空，防止同一句"确认"被执行两次
     assert session.pending is None
 
@@ -150,7 +150,7 @@ def test_pending_action_expires() -> None:
 
 
 def test_pending_action_describe_is_human_readable() -> None:
-    assert "书目 101" in PendingAction(tool="borrow", args={"bookId": 101}).describe()
+    assert "书目 5" in PendingAction(tool="borrow", args={"bookId": 5}).describe()
     assert "记录 5001" in PendingAction(tool="renew", args={"borrowId": 5001}).describe()
 
 

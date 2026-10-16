@@ -44,6 +44,13 @@ class CaseOutcome:
     reply: str = ""
     error: str | None = None
     tools_expected: bool = True
+    #: 该项是否**必须**有工具证据才能算合格（蓝图 §7 硬约束的分母口径）。
+    #: 护栏拒绝（越权/敏感）与"知识库确实没有这条"的诚实答复不算——
+    #: 前者本就不该给数据，后者本来就该说"没查到"。把这两类算进分母，
+    #: 等于在用指标惩罚正确的安全行为，最终会引导实现去掩盖拒绝。
+    requires_evidence: bool = True
+    #: 未通过证据要求的具体原因
+    evidence_gap: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -61,6 +68,8 @@ class CaseOutcome:
             "steps": self.steps,
             "latency_ms": round(self.latency_ms, 1),
             "tool_evidence": self.tool_evidence,
+            "requires_evidence": self.requires_evidence,
+            "evidence_gap": self.evidence_gap,
             "reply": self.reply[:200],
             "error": self.error,
         }
@@ -71,6 +80,10 @@ def _ratio(numerator: int, denominator: int) -> float | None:
     if denominator <= 0:
         return None
     return round(numerator / denominator, 4)
+
+
+def _pct_text(value: float | None) -> str:
+    return "—" if value is None else f"{value:.2%}"
 
 
 def compute_metrics(outcomes: list[CaseOutcome]) -> dict[str, Any]:
@@ -85,8 +98,17 @@ def compute_metrics(outcomes: list[CaseOutcome]) -> dict[str, Any]:
     latencies = [o.latency_ms for o in outcomes if o.latency_ms > 0]
     steps = [o.steps for o in outcomes if o.e2e_ok is not None]
 
-    evidence_required = [o for o in outcomes if o.tools_expected]
+    evidence_required = [o for o in outcomes if o.requires_evidence]
     evidence_ok = [o for o in evidence_required if o.tool_evidence]
+    evidence_missing = [o for o in evidence_required if not o.tool_evidence]
+    #: 原始比例（把"该有证据的"全部算进分母），用于和蓝图 §7 的 100% 硬约束对齐展示
+    raw_required = [o for o in outcomes if o.tools_expected]
+    raw_ok = [o for o in raw_required if o.tool_evidence]
+    excluded = [
+        {"case_id": o.case_id, "category": o.category, "reason": o.evidence_gap or "不适用"}
+        for o in outcomes
+        if o.tools_expected and not o.requires_evidence
+    ]
 
     metrics = {
         "total_cases": total,
@@ -107,6 +129,7 @@ def compute_metrics(outcomes: list[CaseOutcome]) -> dict[str, Any]:
             "tool_args": len(args_judged),
             "e2e": len(e2e_judged),
             "evidence_required": len(evidence_required),
+            "evidence_raw": len(raw_required),
         },
         "slo": _slo_check(
             {
@@ -211,8 +234,9 @@ def to_markdown(metrics: dict[str, Any], breakdown: dict[str, Any], failures: li
         passed = slo_entry.get("pass")
         mark = "—" if passed is None else ("✅" if passed else "❌")
         show = "—" if value is None else (f"{value:.2%}" if value <= 1 else f"{value}")
+        target_text = "—" if target is None else f"{target:.0%}"
         lines.append(
-            f"| {label} | {show} | {target:.0%} | {mark} | {samples.get(sample_key[key], 0)} |"
+            f"| {label} | {show} | {target_text} | {mark} | {samples.get(sample_key[key], 0)} |"
         )
     lines.append("")
     lines.append("| 效率指标 | 实测值 |")
@@ -221,6 +245,27 @@ def to_markdown(metrics: dict[str, Any], breakdown: dict[str, Any], failures: li
     lines.append(f"| 平均延迟 | {metrics['avg_latency_ms']} ms |")
     lines.append(f"| P50 延迟 | {metrics['p50_latency_ms']} ms |")
     lines.append(f"| P95 延迟 | {metrics['p95_latency_ms']} ms |")
+    lines.append("")
+
+    # 证据口径必须写清楚，否则"100% 有证据"很容易变成一个自我安慰的数字
+    raw = metrics.get("tool_evidence_ratio_raw")
+    strict = metrics.get("tool_evidence_ratio")
+    lines.append("### 工具证据口径说明")
+    lines.append("")
+    lines.append(f"- 严格口径（分母含全部业务用例）：**{_pct_text(raw)}**")
+    lines.append(
+        f"- 有效口径（分母排除\"护栏正确拒绝\"与\"知识库确实没有、已如实告知\"）：**{_pct_text(strict)}**"
+    )
+    excluded = metrics.get("evidence_excluded") or []
+    if excluded:
+        lines.append(f"- 已排除 {len(excluded)} 条（不计入证据分母）：")
+        for item in excluded:
+            lines.append(f"  - `{item['case_id']}`（{item['category']}）：{item['reason']}")
+    missing = metrics.get("evidence_missing") or []
+    if missing:
+        lines.append(f"- **仍然缺证据** {len(missing)} 条（这是真实的覆盖率缺口）：")
+        for item in missing:
+            lines.append(f"  - `{item['case_id']}` {item['message']}：{item['reason']}")
     lines.append("")
     lines.append("## 分类别表现")
     lines.append("")

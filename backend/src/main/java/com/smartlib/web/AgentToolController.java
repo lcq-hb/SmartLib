@@ -20,6 +20,7 @@ import com.smartlib.domain.dto.BookQuery;
 import com.smartlib.domain.dto.Dtos.BorrowResult;
 import com.smartlib.domain.dto.Dtos.BookView;
 import com.smartlib.domain.dto.Dtos.LoanView;
+import com.smartlib.domain.dto.Dtos.RecommendItem;
 import com.smartlib.domain.dto.Dtos.ReservationResult;
 import com.smartlib.domain.dto.Dtos.SearchResult;
 import com.smartlib.domain.dto.Dtos.StockView;
@@ -27,6 +28,7 @@ import com.smartlib.service.BookSearchService;
 import com.smartlib.service.BookService;
 import com.smartlib.service.BorrowService;
 import com.smartlib.service.ReaderService;
+import com.smartlib.service.RecommendService;
 import com.smartlib.service.ReservationService;
 import com.smartlib.service.RuleEngine;
 import com.smartlib.service.StockService;
@@ -66,6 +68,7 @@ public class AgentToolController {
     private final BorrowService borrowService;
     private final ReaderService readerService;
     private final ReservationService reservationService;
+    private final RecommendService recommendService;
     private final RuleEngine ruleEngine;
 
     public AgentToolController(BookSearchService bookSearchService,
@@ -74,6 +77,7 @@ public class AgentToolController {
                                BorrowService borrowService,
                                ReaderService readerService,
                                ReservationService reservationService,
+                               RecommendService recommendService,
                                RuleEngine ruleEngine) {
         this.bookSearchService = bookSearchService;
         this.bookService = bookService;
@@ -81,6 +85,7 @@ public class AgentToolController {
         this.borrowService = borrowService;
         this.readerService = readerService;
         this.reservationService = reservationService;
+        this.recommendService = recommendService;
         this.ruleEngine = ruleEngine;
     }
 
@@ -178,6 +183,30 @@ public class AgentToolController {
     @Operation(summary = "工具：预约图书")
     public Result<ReservationResult> reserve(@Valid @RequestBody ReserveToolRequest request) {
         return Result.ok(reservationService.reserve(request.readerId(), request.bookId()));
+    }
+
+    // ------------------- 8. 推荐所需的两条桥接接口 -------------------
+
+    /**
+     * 相似书召回（Agent 的 recommend 工具用）。
+     *
+     * <p>这两条接口是<b>联调时补上的</b>：Agent 侧的 `recommend` 工具需要"相似书"与"热门榜"
+     * 两条数据通道，最初只规划了公共 API 的 `/api/books/{id}/similar` 与 `/api/books/hot`，
+     * 而 Agent 走的是内部命名空间。补在后端而不是改 Agent，是为了保持
+     * "内部工具只在 `/internal/agent/tools/**` 下"这一条边界不被打破 ——
+     * 否则限流隔离、签名校验、调用量打点这三件事就会在内部调用上失效。
+     */
+    @GetMapping("/books/{id}/similar")
+    @Operation(summary = "工具：相似书推荐")
+    public Result<List<RecommendItem>> similarBooks(@PathVariable long id,
+                                                    @RequestParam(defaultValue = "6") int limit) {
+        return Result.ok(recommendService.similarTo(id, limit));
+    }
+
+    @GetMapping("/books/hot")
+    @Operation(summary = "工具：热门榜")
+    public Result<List<BookView>> hotBooks(@RequestParam(defaultValue = "10") int limit) {
+        return Result.ok(bookService.hot(limit));
     }
 
     // --------------------------- 8. 规则/政策问答 ---------------------------

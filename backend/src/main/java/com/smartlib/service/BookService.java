@@ -37,8 +37,28 @@ import io.micrometer.core.instrument.MeterRegistry;
 @Service
 public class BookService {
 
-    /** 书目详情缓存 10 分钟：书目本身很少变，是典型的长缓存对象。 */
-    private static final Duration DETAIL_TTL = Duration.ofMinutes(10);
+    /**
+     * 书目详情缓存 key 前缀。公开为常量是为了让
+     * {@code BookDetailCacheEvictor} 失效缓存时不会因为字符串不一致而静默失效
+     * （拼错的 key 不会报错，只会让缓存永远清不掉 —— 这类 bug 极难发现）。
+     */
+    public static final String DETAIL_KEY_PREFIX = "smartlib:book:";
+
+    /**
+     * 书目详情缓存时长。
+     *
+     * <p><b>为什么只有 30 秒</b>：这个缓存里含有 {@code availableCopies} 这种易变字段。
+     * TTL 的取值依据不是"书目本身多久变一次"（那确实可以是几小时），
+     * 而是"读者能容忍看到多旧的库存"。压测实测过：TTL 为 10 分钟时，
+     * 借出 8 册后详情接口仍返回 8，读者会白跑一趟。
+     *
+     * <p>库存变化时 {@code BookDetailCacheEvictor} 会主动失效当前实例的缓存，
+     * 所以 30 秒这个上界只在"多实例部署、且变更发生在别的实例上"时才生效
+     * （进程内 L1 缓存无法被其他实例清除）。这是一个明确的取舍：
+     * 用缓存命中率换"可接受的偏旧时长"，而不是假装缓存能实时一致。
+     */
+    private static final Duration DETAIL_TTL = Duration.ofSeconds(30);
+
     private static final Duration HOT_TTL = Duration.ofMinutes(1);
     /** 热门榜统计窗口：近 90 天。 */
     private static final int HOT_WINDOW_DAYS = 90;
@@ -68,7 +88,7 @@ public class BookService {
             meterRegistry.counter("smartlib.book.detail", "result", "bloom-rejected").increment();
             throw new BizException(ErrorCode.BOOK_NOT_FOUND, "图书不存在：id=" + bookId);
         }
-        BookView view = cacheGuard.get("smartlib:book:" + bookId, DETAIL_TTL, BookView.class, () -> loadDetail(bookId));
+        BookView view = cacheGuard.get(DETAIL_KEY_PREFIX + bookId, DETAIL_TTL, BookView.class, () -> loadDetail(bookId));
         if (view == null) {
             meterRegistry.counter("smartlib.book.detail", "result", "not-found").increment();
             throw new BizException(ErrorCode.BOOK_NOT_FOUND, "图书不存在：id=" + bookId);

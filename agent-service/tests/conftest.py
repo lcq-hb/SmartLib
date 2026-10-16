@@ -64,11 +64,23 @@ class FakeJavaBackend:
         self.profile: dict[str, Any] | None = None
 
     # ---------------- 默认数据 ----------------
+    #: 假后端的书目表。**id 刻意用真实后端风格的小数字**（算法导论=5、计算机网络=3…），
+    #: 因为离线测试如果用了 101/102 这种"顺手编的 id"，就永远测不出
+    #: "模型拿假 id 打真后端 → 图书不存在" 这个真实缺陷（联调时踩过）。
+    BOOKS: dict[str, dict[str, Any]] = {
+        "算法导论": {"bookId": 5, "availableCopies": 3, "totalCopies": 5},
+        "计算机网络": {"bookId": 3, "availableCopies": 0, "totalCopies": 4},
+        "数据结构与算法分析": {"bookId": 8, "availableCopies": 0, "totalCopies": 4},
+        "深入理解计算机系统": {"bookId": 6, "availableCopies": 2, "totalCopies": 6},
+        "高等数学": {"bookId": 4, "availableCopies": 6, "totalCopies": 10},
+        "机器学习": {"bookId": 10, "availableCopies": 2, "totalCopies": 8},
+    }
+
     def default_loans(self) -> list[dict[str, Any]]:
         return [
             {
                 "borrowId": 5001,
-                "bookId": 101,
+                "bookId": 5,
                 "title": "算法导论",
                 "dueDate": "2026-03-01",
                 "renewCount": 0,
@@ -77,7 +89,7 @@ class FakeJavaBackend:
             },
             {
                 "borrowId": 5002,
-                "bookId": 102,
+                "bookId": 3,
                 "title": "计算机网络",
                 "dueDate": "2026-01-05",
                 "renewCount": 2,
@@ -98,7 +110,7 @@ class FakeJavaBackend:
         return {
             "items": [
                 {
-                    "bookId": 101,
+                    "bookId": 5,
                     "title": "算法导论",
                     "author": "Thomas H. Cormen",
                     "publisher": "机械工业出版社",
@@ -109,7 +121,7 @@ class FakeJavaBackend:
                     "shelfLocation": "3 楼中文科技图书区 TP301.6/C822",
                 },
                 {
-                    "bookId": 106,
+                    "bookId": 8,
                     "title": "数据结构与算法分析",
                     "author": "Mark Allen Weiss",
                     "publisher": "机械工业出版社",
@@ -129,11 +141,13 @@ class FakeJavaBackend:
     # ---------------- 路由 ----------------
     def handle(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
-        # httpx 的 url.query 是**已百分号编码**的原始字节（中文会被编码）。
-        # 后端规格里的 pathWithQuery 是未编码形式，所以这里必须先 unquote 再验签，
-        # 否则中文 query 会因为"%E7%BB..."与"续借"不一致而误判 401。
-        raw_query = request.url.query.decode("utf-8") if request.url.query else ""
-        path_with_query = f"{path}?{unquote(raw_query)}" if raw_query else path
+        # 服务端（Java InternalSignFilter）拿到的 pathWithQuery 就是
+        # getRequestURI() + "?" + getQueryString()，其中 getQueryString() 是
+        # **HTTP 请求行里原始的百分号编码形式**（中文即 %E7%BB%AD%E5%80%9F）。
+        # httpx 的 url.query 正好是这个编码后的 ASCII 字节，所以这里**不能 unquote**——
+        # 早期实现 unquote 过，等于替后端"猜"了一个未编码形式，会掩盖真实的 401 缺陷。
+        raw_query = request.url.query.decode("ascii") if request.url.query else ""
+        path_with_query = f"{path}?{raw_query}" if raw_query else path
         body = request.content or b""
 
         self.calls.append(
@@ -193,13 +207,31 @@ class FakeJavaBackend:
             return self._envelope(self.default_search(str(payload.get("query") or "")))
 
         if path.endswith("/stock") and "/books/" in path:
+            # 回显**请求路径里的真实 id**，而不是写死一个值：
+            # 这样"运行时是否用了工具结果里的 id"才是可断言的
+            requested_id = self._int_from_path(path)
+            title = next(
+                (
+                    name
+                    for name, meta in self.BOOKS.items()
+                    if meta["bookId"] == requested_id
+                ),
+                None,
+            )
+            if title is None:
+                # 真实后端对不存在的书目返回业务错误（code=2002）
+                return httpx.Response(
+                    200,
+                    json={"code": 2002, "msg": f"图书不存在：id={requested_id}", "data": None},
+                )
             available = self.stock_available
+            meta = self.BOOKS[title]
             return self._envelope(
                 {
-                    "bookId": 101,
-                    "title": "算法导论",
+                    "bookId": requested_id,
+                    "title": title,
                     "available": available,
-                    "total": 5,
+                    "total": meta["totalCopies"],
                     "queueLen": 0 if (available or 0) > 0 else 3,
                     "shelfLocation": "3 楼中文科技图书区 TP301.6/C822",
                     "degraded": available is not None and available < 0,
@@ -239,7 +271,7 @@ class FakeJavaBackend:
             topic = ""
             for pair in raw_query.split("&"):
                 if pair.startswith("topic="):
-                    # 同样要先 unquote：后端拿到的是解码后的中文 query 参数
+                    # 业务侧读的是**解码后**的参数值（HTTP 服务器会解码）
                     topic = unquote(pair[len("topic=") :])
             return self._envelope(
                 {
@@ -251,22 +283,29 @@ class FakeJavaBackend:
         if path.endswith("/similar") and "/books/" in path:
             return self._envelope(
                 [
-                    {"bookId": 106, "title": "数据结构与算法分析", "author": "Weiss", "category": "计算机"},
-                    {"bookId": 104, "title": "深入理解计算机系统", "author": "Bryant", "category": "计算机"},
+                    {"bookId": 8, "title": "数据结构与算法分析", "author": "Weiss", "category": "计算机"},
+                    {"bookId": 6, "title": "深入理解计算机系统", "author": "Bryant", "category": "计算机"},
                 ]
             )
 
         if path == "/internal/agent/tools/books/hot":
             return self._envelope(
                 [
-                    {"bookId": 103, "title": "高等数学", "author": "同济大学", "category": "数学"},
-                    {"bookId": 109, "title": "机器学习", "author": "周志华", "category": "计算机"},
+                    {"bookId": 4, "title": "高等数学", "author": "同济大学", "category": "数学"},
+                    {"bookId": 10, "title": "机器学习", "author": "周志华", "category": "计算机"},
                 ]
             )
 
         return self._envelope(None, status=404, msg=f"未实现的假接口: {path}")
 
     # ---------------- 便捷断言 ----------------
+    @staticmethod
+    def _int_from_path(path: str) -> int:
+        for part in path.split("/"):
+            if part.isdigit():
+                return int(part)
+        return 0
+
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self.handle)
 

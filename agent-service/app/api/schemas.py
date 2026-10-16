@@ -36,8 +36,15 @@ class ToolCallTrace(BaseModel):
     ok: bool = False
     latency_ms: float = 0.0
     error_code: str | None = None
+    #: 给读者看的失败原因（不是原始异常文本）。之前这个字段没暴露出去，
+    #: 前端在"没拿到数据"时只能显示 null，看不出到底卡在哪一步。
+    error_message: str | None = None
     summary: str = ""
     blocked_by: str | None = None
+    #: True 表示这是**运行时内部补的步骤**（例如为了拿到真实 book_id 而补的检索），
+    #: 不是模型/读者要求的那次调用。前端展示"用过哪些工具"时应过滤掉它们，
+    #: 否则用户会看到"我明明问的是库存，怎么还检索了一遍"。
+    internal: bool = False
 
 
 class ChatResponse(BaseModel):
@@ -50,6 +57,10 @@ class ChatResponse(BaseModel):
     provider: str = "mock"
     steps: int = 0
     tool_evidence: bool = False
+    #: **只包含读者/模型要求的那次调用**。运行时为了解析真实 book_id 而补的
+    #: 内部步骤（检索 / 库存核验）不进这里，避免前端把过程展示成
+    #: "我问库存，它怎么去检索了"。要排查链路请看 `/admin/traces/{trace_id}`
+    #: 里的 `internal_tool_calls`。
     tool_calls: list[ToolCallTrace] = Field(default_factory=list)
     rag_sources: list[str] = Field(default_factory=list)
     handoff: bool = False
