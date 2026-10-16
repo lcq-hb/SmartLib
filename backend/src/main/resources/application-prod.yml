@@ -1,0 +1,54 @@
+# =============================================================================
+# prod profile：MySQL 8 + Redis 7 多实例部署
+#   - 表结构由部署流程用 deploy/sql 手工/流水线执行，应用不自动建表
+#     （spring.sql.init.mode=never，避免生产被 drop table）
+#   - 多实例无状态部署，Nginx/K8s 做负载
+# =============================================================================
+spring:
+  datasource:
+    url: jdbc:mysql://${MYSQL_HOST:mysql}:${MYSQL_PORT:3306}/${MYSQL_DATABASE:smartlib}?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai&rewriteBatchedStatements=true&allowPublicKeyRetrieval=true
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    username: ${MYSQL_USER:smartlib}
+    password: ${MYSQL_PASSWORD:smartlib}
+    hikari:
+      maximum-pool-size: 50
+      minimum-idle: 10
+      connection-timeout: 3000
+      max-lifetime: 1800000
+      pool-name: smartlib-hikari-prod
+
+  sql:
+    init:
+      mode: never
+
+  data:
+    redis:
+      host: ${REDIS_HOST:redis}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 1000ms
+      lettuce:
+        pool:
+          max-active: 32
+          max-idle: 16
+          min-idle: 4
+
+smartlib:
+  # 生产默认使用 Redis + Lua 原子预扣，Redis 故障时自动降级为 DB 条件更新
+  stock:
+    strategy: ${STOCK_STRATEGY:redis-lua}
+    degrade-on-redis-failure: true
+  search:
+    engine: ${SEARCH_ENGINE:inverted-index}
+  internal:
+    sign-secret: ${SMARTLIB_INTERNAL_SIGN}
+
+management:
+  endpoint:
+    health:
+      show-details: when-authorized
+
+logging:
+  level:
+    root: INFO
+    com.smartlib: INFO

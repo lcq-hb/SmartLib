@@ -1,0 +1,376 @@
+# =============================================================================
+# SmartLib 部署编排（Docker Compose）
+#
+# 拓扑（对应蓝图 §4.1 / §6.3 A2）：
+#   nginx(80) ──┬─> backend-1(8081:8080) ─┐
+#               │                          ├─> mysql(3306)
+#               └─> backend-2(8082:8080) ─┘   redis(6379)
+#               └─> agent-1(8001:8000) / agent-2(8002:8000)
+#
+# 【如何启动 —— 必须从 deploy/ 目录执行，原因是 Docker 的 build context 规则】
+#   cd deploy
+#   docker compose up -d --build
+#   docker compose ps
+#   docker compose logs -f backend-1
+#   docker compose down            # 保留数据卷
+#   docker compose down -v         # 清空数据卷（会重跑 initdb 脚本）
+#
+#   Docker 硬性要求：Dockerfile 必须位于 build context 之内。
+#   本文件用 context: .（即 deploy/），于是可以直接引用同级目录下的
+#   Dockerfile.backend / Dockerfile.agent —— 两者同时成立。
+#   如果一定要在仓库根目录执行 `docker compose -f deploy/docker-compose.yml up`，
+#   context 就得写成 ..，而那样 Dockerfile 会落到 context 之外，Docker 直接拒绝。
+#   根目录变体的做法见 deploy/README.md「已知限制」第 1 条。
+#
+# 健康检查为什么要 override：
+#   运行时镜像是 eclipse-temurin:21-jre，既没有 curl 也没有 wget；
+#   所以用 bash 的 /dev/tcp 直接发一个 HTTP 请求探测 /actuator/health。
+# =============================================================================
+
+name: smartlib
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # MySQL 8.0：业务主库
+  #   - ./sql 挂到 /docker-entrypoint-initdb.d，容器首次初始化时按文件名字典序执行：
+  #       01-schema.sql（表结构，与 backend/src/main/resources/db/schema.sql 同步）
+  #       02-seed.sql（演示数据）
+  #       03-mysql-production-extras.sql（ngram 全文索引/分区/账号，必须最后执行）
+  #   - 初始化脚本只在"数据目录为空"时执行一次；改了脚本要 down -v 才会重跑。
+  #   - gen_books.py 生成的 books_bulk.sql 在 ./sql/generated/ 下（已 gitignore），
+  #     灌数据请手工执行（见 deploy/README.md），不要让它混进 initdb 的字典序里。
+  # ---------------------------------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    container_name: smartlib-mysql
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+08:00
+      - --max_connections=500
+      - --innodb-buffer-pool-size=512M
+      # ngram 全文索引分词长度：中文检索按 2 字切分（Q4 方案前置条件）
+      - --ngram_token_size=2
+      # 慢查询：压测期间用来定位"高并发下锁竞争"的具体语句
+      - --slow-query-log=1
+      - --long-query-time=0.5
+      - --slow-query-log-file=/var/lib/mysql/slow.log
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-smartlib}
+      MYSQL_USER: ${MYSQL_USER:-smartlib}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-smartlib}
+      TZ: Asia/Shanghai
+    ports:
+      # 宿主机 3306 可能已被本机 MySQL 占用；冲突时改成 "13306:3306" 并同步改后端 env
+      - "${MYSQL_PORT_HOST:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    networks:
+      - smartlib-net
+
+  # ---------------------------------------------------------------------------
+  # Redis 7：L2 缓存 + Lua 原子预扣（S5 策略）
+  #   appendonly yes：预扣数据必须落盘，否则重启会丢"已预扣未落库"的量
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: smartlib-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - allkeys-lru
+    ports:
+      - "${REDIS_PORT_HOST:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - smartlib-net
+
+  # ---------------------------------------------------------------------------
+  # 后端实例 1（蓝）：8081 -> 容器内 8080
+  # ---------------------------------------------------------------------------
+  backend-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+      args:
+        MAVEN_OPTS: -Dfile.encoding=UTF-8
+    image: smartlib/backend:1.0.0
+    container_name: smartlib-backend-1
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      # 多实例无状态：会话/trace 外置，实例之间可任意替换（A1）
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-smartlib}
+      MYSQL_USER: ${MYSQL_USER:-smartlib}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-smartlib}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      # 生产默认 redis-lua；压测脚本会用 /api/admin/stock-strategy 运行期切换
+      SMARTLIB_STOCK_STRATEGY: ${STOCK_STRATEGY:-redis-lua}
+      SEARCH_ENGINE: ${SEARCH_ENGINE:-inverted-index}
+      # Agent 服务调用 /internal/** 用的 HMAC 密钥，两个后端实例必须一致
+      SMARTLIB_INTERNAL_SIGN: ${SMARTLIB_INTERNAL_SIGN:-dev-internal-secret-please-change}
+      # 压测需要运行期切换策略/引擎，因此打开管理端点（生产应关闭或加鉴权）
+      SMARTLIB_ADMIN_ENABLED: ${SMARTLIB_ADMIN_ENABLED:-true}
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -XX:+UseG1GC -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai"
+      TZ: Asia/Shanghai
+    ports:
+      - "${BACKEND1_PORT:-8081}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /actuator/health HTTP/1.0\r\n\r\n' >&3 && head -c 300 <&3 | grep -q UP"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1g
+        reservations:
+          cpus: "0.5"
+          memory: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    networks:
+      - smartlib-net
+
+  # ---------------------------------------------------------------------------
+  # 后端实例 2（绿）：8082 -> 容器内 8080
+  #   与实例 1 唯一差别是宿主端口；镜像、配置、探针完全一致（保证"无状态"可验证）
+  # ---------------------------------------------------------------------------
+  backend-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    image: smartlib/backend:1.0.0
+    container_name: smartlib-backend-2
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-smartlib}
+      MYSQL_USER: ${MYSQL_USER:-smartlib}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-smartlib}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      SMARTLIB_STOCK_STRATEGY: ${STOCK_STRATEGY:-redis-lua}
+      SEARCH_ENGINE: ${SEARCH_ENGINE:-inverted-index}
+      SMARTLIB_INTERNAL_SIGN: ${SMARTLIB_INTERNAL_SIGN:-dev-internal-secret-please-change}
+      SMARTLIB_ADMIN_ENABLED: ${SMARTLIB_ADMIN_ENABLED:-true}
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -XX:+UseG1GC -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai"
+      TZ: Asia/Shanghai
+    ports:
+      - "${BACKEND2_PORT:-8082}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /actuator/health HTTP/1.0\r\n\r\n' >&3 && head -c 300 <&3 | grep -q UP"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1g
+        reservations:
+          cpus: "0.5"
+          memory: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    networks:
+      - smartlib-net
+
+  # ---------------------------------------------------------------------------
+  # Agent 服务实例 1：8001 -> 容器内 8000
+  #   LLM_PROVIDER=mock：无 API Key 也能完整跑通（MockLLM 确定性模拟）
+  # ---------------------------------------------------------------------------
+  agent-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: smartlib/agent:1.0.0
+    container_name: smartlib-agent-1
+    restart: unless-stopped
+    depends_on:
+      # Agent 启动时要预热书目缓存/建立连接池，因此等后端健康再起，避免启动即失败
+      backend-1:
+        condition: service_healthy
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      SMARTLIB_BACKEND_BASE_URL: http://backend-1:8080
+      SMARTLIB_INTERNAL_SIGN: ${SMARTLIB_INTERNAL_SIGN:-dev-internal-secret-please-change}
+      LOG_LEVEL: INFO
+      TZ: Asia/Shanghai
+    ports:
+      - "${AGENT1_PORT:-8001}:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3).status==200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768m
+        reservations:
+          cpus: "0.25"
+          memory: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    networks:
+      - smartlib-net
+
+  # ---------------------------------------------------------------------------
+  # Agent 服务实例 2：8002 -> 容器内 8000
+  # ---------------------------------------------------------------------------
+  agent-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: smartlib/agent:1.0.0
+    container_name: smartlib-agent-2
+    restart: unless-stopped
+    depends_on:
+      backend-2:
+        condition: service_healthy
+    environment:
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      SMARTLIB_BACKEND_BASE_URL: http://backend-2:8080
+      SMARTLIB_INTERNAL_SIGN: ${SMARTLIB_INTERNAL_SIGN:-dev-internal-secret-please-change}
+      LOG_LEVEL: INFO
+      TZ: Asia/Shanghai
+    ports:
+      - "${AGENT2_PORT:-8002}:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3).status==200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 768m
+        reservations:
+          cpus: "0.25"
+          memory: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    networks:
+      - smartlib-net
+
+  # ---------------------------------------------------------------------------
+  # Nginx 入口：80（A2 多实例 + 上游负载 + 限流 + SSE 透传）
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: smartlib-nginx
+    restart: unless-stopped
+    depends_on:
+      backend-1:
+        condition: service_healthy
+      backend-2:
+        condition: service_healthy
+    ports:
+      - "${NGINX_PORT:-80}:80"
+    volumes:
+      # 挂到 conf.d 而不是覆盖 nginx.conf：官方镜像的 /etc/nginx/nginx.conf 已经在
+      # http 块里 include conf.d/*.conf，所以我们的文件是"http 上下文片段"，
+      # 不需要（也不应该）自带 events/http 外壳。
+      - ./nginx:/etc/nginx/conf.d:ro
+      - nginx-logs:/var/log/nginx
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/nginx-health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    networks:
+      - smartlib-net
+
+# =============================================================================
+# 命名网络：固定子网便于 Nginx 的 allow 172.16.0.0/12; deny all; 生效
+# =============================================================================
+networks:
+  smartlib-net:
+    name: smartlib-net
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.20.0.0/16
+
+# =============================================================================
+# 命名卷
+# =============================================================================
+volumes:
+  mysql-data:
+    name: smartlib-mysql-data
+    labels:
+      com.smartlib.description: "MySQL 8 数据目录（业务数据，down 不删）"
+  redis-data:
+    name: smartlib-redis-data
+    labels:
+      com.smartlib.description: "Redis AOF/RDB 持久化目录"
+  nginx-logs:
+    name: smartlib-nginx-logs
+    labels:
+      com.smartlib.description: "Nginx access/error 日志（json-file 之外的落盘副本）"

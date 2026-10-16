@@ -1,0 +1,63 @@
+# =============================================================================
+# test profile：单元/集成测试专用
+#   - 与 local 一样用 H2 内存库，但把各类超时放宽（并发测试会有大量锁等待）
+#   - 关闭定时任务：否则测试期间定时任务会改动数据，导致断言不稳定
+#   - 关闭 L2 缓存：测试无需 Redis，避免每个用例都先失败一次
+# =============================================================================
+spring:
+  datasource:
+    # LOCK_TIMEOUT 放大到 10 秒：并发抢书测试里会有 200 个线程争抢同一行
+    url: jdbc:h2:mem:smartlib_test;DB_CLOSE_DELAY=-1;MODE=MySQL;DATABASE_TO_LOWER=TRUE;LOCK_TIMEOUT=10000
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+    hikari:
+      maximum-pool-size: 64
+      minimum-idle: 8
+      connection-timeout: 30000
+
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:db/schema.sql
+      data-locations: classpath:db/data.sql
+      continue-on-error: false
+      encoding: UTF-8
+
+smartlib:
+  stock:
+    strategy: optimistic-db
+  search:
+    engine: inverted-index
+    index:
+      build-on-startup: true
+      # 测试环境书目少，限制得小一点可以加快上下文启动
+      max-docs: 20000
+    cache:
+      l2:
+        enabled: false
+      bloom-enabled: true
+      bloom-expected-insertions: 10000
+      bloom-fpp: 0.001
+  admin:
+    enabled: true
+  scheduled:
+    enabled: false
+  # 测试里把限流阈值调大，避免并发用例互相触发 429（限流本身由专门的单测覆盖）
+  rate-limit:
+    enabled: false
+    capacity: 100000
+    refill-per-second: 100000
+  circuit-breaker:
+    failure-rate-threshold: 0.5
+    minimum-calls: 10
+    open-duration-seconds: 2
+    half-open-probes: 3
+
+logging:
+  level:
+    root: WARN
+    com.smartlib: INFO
+    org.springframework.jdbc.datasource.init: WARN
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [%X{traceId:-}] %logger{28} - %msg%n"

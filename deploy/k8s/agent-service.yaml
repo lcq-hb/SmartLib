@@ -1,0 +1,26 @@
+# =============================================================================
+# SmartLib Agent 服务 Service
+#
+# 注意：SSE 流式接口经 Service 转发时，kube-proxy 只做 L4，不会缓冲；
+#       真正会缓冲的是 Ingress Controller 的 proxy-buffering 默认值，
+#       因此 ingress.yaml 里对 /agent/ 显式关掉了 buffering。
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent
+  namespace: smartlib
+  labels:
+    app.kubernetes.io/name: smartlib-agent
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: smartlib
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: smartlib-agent
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+  sessionAffinity: None

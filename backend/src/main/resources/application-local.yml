@@ -1,0 +1,57 @@
+# =============================================================================
+# local profile：零外部依赖启动（H2 内存库）
+#   - 不需要安装 MySQL / Redis / Elasticsearch
+#   - 每次启动重建表并灌入演示数据（schema.sql 含 drop table）
+#   - 用途：本地开发、单元测试、面试现场演示
+# =============================================================================
+spring:
+  datasource:
+    url: jdbc:h2:mem:smartlib;DB_CLOSE_DELAY=-1;MODE=MySQL;DATABASE_TO_LOWER=TRUE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+    hikari:
+      maximum-pool-size: 32
+      minimum-idle: 8
+      pool-name: smartlib-hikari
+      connection-timeout: 3000
+
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:db/schema.sql
+      data-locations: classpath:db/data.sql
+      continue-on-error: false
+      encoding: UTF-8
+
+  # 本地没有 Redis，Lettuce 为懒连接：只有真正使用 Redis 的策略才会触发连接失败并降级
+  data:
+    redis:
+      host: 127.0.0.1
+      port: 6379
+      timeout: 500ms
+      connect-timeout: 500ms
+
+smartlib:
+  # 本地默认走数据库条件更新；演示"Redis 不可用自动降级"时改为 redis-lua
+  stock:
+    strategy: optimistic-db
+  search:
+    engine: inverted-index
+    cache:
+      # 本地没有 Redis，关掉 L2 可以避免每个请求都先失败一次再短路，日志更干净
+      l2:
+        enabled: false
+  # 本地打开管理接口，供压测脚本在运行期切换库存策略与检索引擎
+  admin:
+    enabled: true
+
+logging:
+  level:
+    com.smartlib: DEBUG
+    org.springframework.jdbc.datasource.init: INFO

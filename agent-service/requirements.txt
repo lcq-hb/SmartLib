@@ -1,0 +1,13 @@
+# SmartLib Agent 服务依赖（Python 3.12）
+# 固定版本：本机 .venv 已验证可安装、可跑通 pytest 与评测
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+pydantic>=2.9,<3
+pydantic-settings==2.7.0
+python-multipart==0.0.20
+numpy==2.2.1
+
+# 测试与评测
+pytest==8.3.4
+pytest-asyncio==0.25.2

@@ -1,0 +1,95 @@
+# =============================================================================
+# SmartLib 仓库忽略规则
+# 原则：
+#   1) 只忽略"构建产物 / 本机工具 / 生成数据 / 本地配置"，源码与文档一律入库；
+#   2) 生成物目录（deploy/sql/generated、scripts/bench/results）保留 .gitkeep 占位，
+#      保证克隆后目录结构立即可用（生成器不会因为目录不存在而失败）。
+# =============================================================================
+
+# ---------------------------- Java / Maven ----------------------------------
+target/
+*.class
+*.jar
+*.war
+!.mvn/wrapper/maven-wrapper.jar
+.mvn/wrapper/maven-wrapper.properties.bak
+dependency-reduced-pom.xml
+*.versionsBackup
+hs_err_pid*.log
+replay_pid*.log
+
+# ---------------------------- Python ----------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+# agent-service/eval 的评测产物（避免把一次评测结果当基线提交）
+report.json
+
+# ---------------------------- IDE / 编辑器 ----------------------------------
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.project
+.classpath
+*.swp
+*~
+
+# ---------------------------- 本地工具链（不入库） ---------------------------
+# e.g. .tools/apache-maven-3.9.9、.tools/m2repo、.tools/pylibs
+.tools/
+
+# ---------------------------- 生成数据 / 压测结果 ---------------------------
+# 数据生成器产物（20 万行级别，绝不入库；README 说明如何本地生成）
+deploy/sql/generated/
+!deploy/sql/generated/.gitkeep
+# 基准测试的"每次运行产物"不入库（随环境波动），但**汇总报告要入库**：
+# 它是项目"零超卖 / 检索提速"这些结论的实测证据，面试时可直接展示。
+# 注意：必须先排除目录内容再逐一放行，否则 git 不会进入被排除的目录。
+scripts/bench/results/*
+!scripts/bench/results/.gitkeep
+!scripts/bench/results/*.md
+# pytest 在本机受限环境下创建、且无法删除的临时目录
+agent-service/.pytest-tmp/
+agent-service/pytest-cache-files-*/
+.pytest-tmp/
+
+# ---------------------------- 日志与本地数据库文件 --------------------------
+*.log
+logs/
+*.mv.db
+*.trace.db
+*.h2.db
+*.lock.db
+*.pid
+*.lck
+
+# ---------------------------- 环境变量 / 密钥 -------------------------------
+.env
+.env.*
+!.env.example
+# K8s 真实 Secret 绝不入库，只提交 .example
+deploy/k8s/secret.yaml
+
+# ---------------------------- OS --------------------------------------------
+.DS_Store
+._*
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/

@@ -1,0 +1,164 @@
+# =============================================================================
+# SmartLib Ingress（对外入口）
+#
+# 与 Compose 版本的对应关系：
+#   Compose 用 Nginx（deploy/nginx/nginx.conf）做入口；
+#   K8s 里入口由 Ingress Controller 承担，因此本文件覆盖了 Nginx 的四个职责：
+#     1) /api/      -> backend Service（负载到 2 个后端 Pod）
+#     2) /agent/    -> agent Service（SSE，必须关 buffering）
+#     3) /internal/ -> 只允许集群内网段（白名单 annotation）
+#     4) 限流       -> annotation 里的 rps/connections 限制
+#
+# 依赖：集群里必须有 Ingress Controller。本文件按 nginx ingress controller 写注解；
+#       用 Traefik/ALB 时需要把注解换成各自实现（可用性不受影响）。
+#
+# 前置（否则 internal 白名单语义不成立）：
+#   controller 必须配置 --enable-real-ip 或用 proxy-real-ip-cidr，
+#   保证 $remote_addr 是真实客户端 IP 而不是 controller 自身。
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: smartlib-ingress
+  namespace: smartlib
+  labels:
+    app.kubernetes.io/name: smartlib
+    app.kubernetes.io/component: ingress
+    app.kubernetes.io/part-of: smartlib
+  annotations:
+    # ---------------------------- 通用 ---------------------------------------
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"   # 本地/内网无证书；上 TLS 后改 true
+    nginx.ingress.kubernetes.io/proxy-body-size: "4m"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "5"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    # 上游保活：减少三次握手，压测时 QPS 明显更稳
+    nginx.ingress.kubernetes.io/upstream-keepalive-connections: "32"
+    nginx.ingress.kubernetes.io/upstream-keepalive-timeout: "60"
+    # 被动健康检查：与 Compose 版 max_fails=2 fail_timeout=10s 语义一致
+    nginx.ingress.kubernetes.io/upstream-max-fails: "2"
+    nginx.ingress.kubernetes.io/upstream-fail-timeout: "10"
+
+    # ---------------------------- 入口限流（对应 A4） -------------------------
+    nginx.ingress.kubernetes.io/limit-rps: "200"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "3"
+    nginx.ingress.kubernetes.io/limit-connections: "100"
+    nginx.ingress.kubernetes.io/limit-rpm: "6000"
+
+    # ---------------------------- 内网白名单（对应 /internal/） ---------------
+    # 只允许集群 Pod 网段访问；Compose 版用的是 allow 172.16.0.0/12。
+    # 【必须按实际集群改】常见值：
+    #   k3s 默认        10.42.0.0/16
+    #   Calico 默认     192.168.0.0/16
+    #   云托管常见      10.0.0.0/8
+    nginx.ingress.kubernetes.io/whitelist-source-range: "10.42.0.0/16,10.0.0.0/8,172.16.0.0/12"
+    # 后端自己做 HMAC 校验（X-Internal-Sign），这里的网段限制是第一道闸
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: smartlib.local
+      http:
+        paths:
+          # ---------------------------- Agent（含 SSE 流） -------------------
+          # 必须放在 /api 之前？不需要——Ingress 的 path 是按最长前缀匹配，
+          # 但 nginx controller 生成 location 时的顺序建议把长前缀写在前，便于人工阅读。
+          - path: /agent/chat/
+            pathType: Prefix
+            backend:
+              service:
+                name: agent
+                port:
+                  number: 8000
+          - path: /agent/
+            pathType: Prefix
+            backend:
+              service:
+                name: agent
+                port:
+                  number: 8000
+          # ---------------------------- 内部工具接口 -------------------------
+          - path: /internal/
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8080
+          # ---------------------------- 健康探针 -----------------------------
+          - path: /actuator/health
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8080
+          # ---------------------------- 业务接口 -----------------------------
+          - path: /api/
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8080
+  # TLS：真实部署时打开并挂证书（cert-manager 自动签发或手工 Secret）
+  # tls:
+  #   - hosts:
+  #       - smartlib.local
+  #     secretName: smartlib-tls
+---
+# =============================================================================
+# SSE 专用 Ingress（备选方案，默认不要与上面那份同时 apply！）
+#
+# 为什么单独给一份：
+#   同一个 Ingress 对象无法给单个 path 单独关 buffering。
+#
+# 【关键限制】nginx ingress controller 遇到多份 Ingress 声明【相同 host+path】时会
+#   报 "path ... is already defined in ingress ..." 并忽略后创建的那条，
+#   所以下面这份【不能】和上面带 /agent/ 的那份并存。
+#   正确用法二选一：
+#     方案 A（推荐，零集群配置）：删掉上面 Ingress 里的 /agent/ 路径，
+#       只保留 /api/ 与 /internal/；然后 apply 本文件。
+#     方案 B（最省事，本项目 Agent 侧优先用）：应用侧在 SSE 响应里返回
+#       `X-Accel-Buffering: no`，controller 收到后自动关闭缓冲，
+#       这样上面那一份 Ingress 就够了，本文件根本不用 apply。
+#
+# 前置：需要 controller 开启 allow-snippet-annotations（1.9+ 默认 true）。
+# =============================================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: smartlib-ingress-sse
+  namespace: smartlib
+  labels:
+    app.kubernetes.io/name: smartlib
+    app.kubernetes.io/component: ingress-sse
+    app.kubernetes.io/part-of: smartlib
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    # SSE 长连接：读超时 600s（与 Compose 版 proxy_read_timeout 600s 对齐）
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    # 单客户端并发连接限制放宽：一条 SSE 长连接会长期占用配额
+    nginx.ingress.kubernetes.io/limit-connections: "40"
+    nginx.ingress.kubernetes.io/limit-rps: "20"
+    configuration-snippet: |
+      proxy_set_header Connection "";
+      chunked_transfer_encoding on;
+      gzip off;
+spec:
+  ingressClassName: nginx
+  rules:
+    # 【与主 Ingress 区分 host】避免 path 冲突；真实使用时把主机名换成对外域名，
+    # 并同步删掉主 Ingress 里的 /agent/ 路径（见上方"正确用法"）。
+    - host: sse.smartlib.local
+      http:
+        paths:
+          - path: /agent/
+            pathType: Prefix
+            backend:
+              service:
+                name: agent
+                port:
+                  number: 8000

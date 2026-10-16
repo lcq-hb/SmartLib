@@ -1,0 +1,88 @@
+# =============================================================================
+# SmartLib Agent 服务镜像（Python 3.12 + FastAPI + Uvicorn）
+#
+# 构建（build context = deploy/ 目录，与 docker-compose.yml 的 context: . 一致）：
+#   cd deploy
+#   docker build -f Dockerfile.agent -t smartlib/agent:1.0.0 .
+#
+# 【关于 context】与 Dockerfile.backend 相同的约束与理由，见该文件顶部注释
+#   （Dockerfile 必须在 context 内 -> context 只能是 deploy/；
+#    根目录 context 的变体做法见 deploy/README.md「已知限制」第 1 条）。
+#
+# 【前置依赖】本文件 COPY 的 agent-service/requirements.txt 与
+#   agent-service/app/ 必须存在（agent-service 由项目其它部分提供）。
+#   缺文件时构建会明确失败在对应的 COPY 步骤 —— 这是刻意的：
+#   宁可在构建期报错，也不要 pip 装空依赖后跑出一个缺库的运行镜像。
+#
+# 设计要点：
+#   * 多阶段：builder 里编译 wheel（gcc 等工具链不进运行镜像）
+#   * 先 COPY requirements.txt 装依赖，再 COPY 源码 —— 改代码不会重装依赖
+#   * 依赖用 --prefix=/install 装到独立目录，运行阶段整体 COPY 过来（体积小、可控）
+#   * 非 root（uid 10002）运行；FastAPI 由 uvicorn 直接 exec 启动，能收到 SIGTERM
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: 依赖构建
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim AS builder
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# 只有编译 C 扩展（如某些向量库）时才需要工具链；纯 wheel 依赖不会用到
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+# 依赖层：只依赖 requirements.txt
+COPY agent-service/requirements.txt ./requirements.txt
+RUN python -m pip install --upgrade pip \
+ && python -m pip install --prefix=/install -r requirements.txt
+
+# ---------------------------------------------------------------------------
+# Stage 2: 运行
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    TZ=Asia/Shanghai \
+    LANG=C.UTF-8
+
+# tini 做 PID 1：uvicorn 的 --workers 模式会 fork 子进程，
+# 没有 init 进程时 SIGTERM 不会转发给子进程，优雅停机失效
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tini \
+ && rm -rf /var/lib/apt/lists/* \
+ && groupadd --system --gid 10002 smartlib \
+ && useradd --system --uid 10002 --gid 10002 --create-home --shell /usr/sbin/nologin smartlib
+
+WORKDIR /app
+
+# 依赖与源码分开 COPY：源码改动只重建最后一层
+COPY --from=builder /install /usr/local
+COPY --chown=10002:10002 agent-service/ /app/
+
+USER 10002:10002
+
+EXPOSE 8000
+
+# 优雅停机：uvicorn 收到 SIGTERM 会先处理完在途请求再退出
+STOPSIGNAL SIGTERM
+
+# 容器内探针（Compose/K8s 也可用）：纯标准库，不依赖 curl
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=8 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+# exec 形式：uvicorn 直接成为子进程并被 tini 正确转发信号
+CMD ["python", "-m", "uvicorn", "app.main:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--proxy-headers", \
+     "--forwarded-allow-ips", "*", \
+     "--timeout-keep-alive", "65"]

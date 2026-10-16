@@ -1,0 +1,188 @@
+[
+  {
+    "query": "深入理解Java虚拟机",
+    "expected_book_ids": [1],
+    "note": "书名精确命中。若 Q1(like) 都召回不到，说明接口/数据有问题，不是引擎问题"
+  },
+  {
+    "query": "Java 虚拟机",
+    "expected_book_ids": [1],
+    "note": "带空格的中文书名片段：检验分词与空格处理"
+  },
+  {
+    "query": "JVM",
+    "expected_book_ids": [1],
+    "note": "纯 tags 命中（tags='Java,JVM,性能调优,虚拟机'）"
+  },
+  {
+    "query": "Java并发编程实战",
+    "expected_book_ids": [2]
+  },
+  {
+    "query": "Java 并发",
+    "expected_book_ids": [2],
+    "note": "短词组合，检验 ngram(2) 分词召回"
+  },
+  {
+    "query": "Brian Goetz",
+    "expected_book_ids": [2],
+    "note": "英文作者名（含空格）"
+  },
+  {
+    "query": "计算机网络 自顶向下",
+    "expected_book_ids": [3],
+    "note": "蓝图 §1.2 P2 里被吐槽的查询形态之一"
+  },
+  {
+    "query": "Kurose",
+    "expected_book_ids": [3],
+    "note": "英文作者姓的部分匹配"
+  },
+  {
+    "query": "数据库系统概念",
+    "expected_book_ids": [4]
+  },
+  {
+    "query": "数据库 事务",
+    "expected_book_ids": [4],
+    "note": "跨 title + tags 的组合查询"
+  },
+  {
+    "query": "算法导论",
+    "expected_book_ids": [5]
+  },
+  {
+    "query": "动态规划 图论",
+    "expected_book_ids": [5],
+    "note": "两个 tags 词同时命中同一本书"
+  },
+  {
+    "query": "设计模式",
+    "expected_book_ids": [6],
+    "note": "'设计模式'同时出现在 6 号书书名与 7 号书 tags 中，观察多命中时的排序"
+  },
+  {
+    "query": "重构 改善既有代码",
+    "expected_book_ids": [7]
+  },
+  {
+    "query": "Martin Fowler",
+    "expected_book_ids": [7],
+    "note": "英文作者全名"
+  },
+  {
+    "query": "深入理解计算机系统",
+    "expected_book_ids": [8]
+  },
+  {
+    "query": "汇编 链接",
+    "expected_book_ids": [8],
+    "note": "低权重 tags 词"
+  },
+  {
+    "query": "Elasticsearch实战",
+    "expected_book_ids": [9]
+  },
+  {
+    "query": "倒排索引",
+    "expected_book_ids": [9],
+    "note": "tags 命中；对 Q3(自研倒排) 是最有叙事价值的一条查询"
+  },
+  {
+    "query": "Redis设计与实现",
+    "expected_book_ids": [10]
+  },
+  {
+    "query": "黄健宏",
+    "expected_book_ids": [10],
+    "note": "中文作者全名"
+  },
+  {
+    "query": "高性能MySQL",
+    "expected_book_ids": [11]
+  },
+  {
+    "query": "慢查询 分库分表",
+    "expected_book_ids": [11]
+  },
+  {
+    "query": "Spring实战",
+    "expected_book_ids": [12]
+  },
+  {
+    "query": "IoC AOP",
+    "expected_book_ids": [12],
+    "note": "纯英文缩写 tags 词"
+  },
+  {
+    "query": "数学分析新讲",
+    "expected_book_ids": [13]
+  },
+  {
+    "query": "高等代数",
+    "expected_book_ids": [14]
+  },
+  {
+    "query": "概率论与数理统计",
+    "expected_book_ids": [15]
+  },
+  {
+    "query": "离散数学 图论",
+    "expected_book_ids": [16]
+  },
+  {
+    "query": "经济学原理",
+    "expected_book_ids": [17]
+  },
+  {
+    "query": "罗宾斯 组织行为",
+    "expected_book_ids": [18],
+    "note": "中文译名 + tags 组合"
+  },
+  {
+    "query": "红楼梦",
+    "expected_book_ids": [19]
+  },
+  {
+    "query": "曹雪芹",
+    "expected_book_ids": [19]
+  },
+  {
+    "query": "平凡的世界",
+    "expected_book_ids": [20]
+  },
+  {
+    "query": "路遥 长篇小说",
+    "expected_book_ids": [20]
+  },
+  {
+    "query": "活着",
+    "expected_book_ids": [21],
+    "note": "二字短查询：检验短词是否被分词器吞掉（ngram_token_size=2 的边界）"
+  },
+  {
+    "query": "万历十五年",
+    "expected_book_ids": [22]
+  },
+  {
+    "query": "黄仁宇 明史",
+    "expected_book_ids": [22]
+  },
+  {
+    "query": "西方哲学史",
+    "expected_book_ids": [23]
+  },
+  {
+    "query": "罗素 认识论",
+    "expected_book_ids": [23],
+    "note": "作者简称（'罗素' vs 全名'伯特兰·罗素'）：检验部分匹配能力"
+  },
+  {
+    "query": "新概念英语",
+    "expected_book_ids": [24]
+  },
+  {
+    "query": "英语 语法",
+    "expected_book_ids": [24]
+  }
+]

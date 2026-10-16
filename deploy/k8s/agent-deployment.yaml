@@ -1,0 +1,124 @@
+# =============================================================================
+# SmartLib Agent 服务 Deployment（无状态，2 副本）
+#
+# 与后端的差异（都是有理由的，不是复制粘贴）：
+#   * 探针只打 /health：Agent 自己的健康端点，不去探后端；后端不可用时
+#     Agent 仍需存活，否则"后端挂了 → Agent 也被重启"，故障被放大
+#   * 优雅停机给到 60s：SSE 流式回答可能持续几十秒，preStop sleep 5 +
+#     terminationGracePeriodSeconds=60 让在途的流式会话把话说完
+#   * LLM_PROVIDER=mock：默认零 Key 可跑（MockLLM 确定性模拟）；切真实模型只改
+#     ConfigMap/Secret，不动镜像
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smartlib-agent
+  namespace: smartlib
+  labels:
+    app.kubernetes.io/name: smartlib-agent
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: smartlib
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: smartlib-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: smartlib-agent
+        app.kubernetes.io/component: agent
+        app.kubernetes.io/part-of: smartlib
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "8000"
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10002
+        runAsGroup: 10002
+        fsGroup: 10002
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: smartlib-agent
+      containers:
+        - name: agent
+          image: smartlib/agent:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: smartlib-config
+            - secretRef:
+                name: smartlib-secret
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "768Mi"
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                # 流式会话收尾：先摘流量，再让 uvicorn 处理完在途请求
+                command: ["/bin/sh", "-c", "sleep 5"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

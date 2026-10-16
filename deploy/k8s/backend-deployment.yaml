@@ -1,0 +1,154 @@
+# =============================================================================
+# SmartLib 后端 Deployment（无状态，2 副本）
+#
+# 对应蓝图 §6.3 的 A1(无状态) / A2(多实例) / A4(限流) / A6(探针+优雅停机)
+#
+# 关键设计：
+#   * replicas: 2 + Pod 反亲和：优先打散到不同节点，避免单节点故障全灭（硬约束
+#     用 required 会在单节点集群里卡在 Pending，所以用 preferred 更实用）
+#   * 滚动更新 maxSurge=1 / maxUnavailable=0：更新期间可用副本数不下降，
+#     配合 readiness 探针实现"先起新的、健康了再摘旧的"
+#   * 三类探针分工：
+#       startup   —— 给 JVM 冷启动 + 倒排索引预热留足时间（最长 150s）
+#       readiness —— 决定是否接流量；Spring Boot 的 readiness 组含 db/redis 依赖
+#       liveness  —— 只判断"进程是不是卡死"，绝不能用 readiness 那套（依赖抖动会
+#                    触发无意义重启，形成"重启风暴"）
+#   * 优雅停机：preStop sleep 5 秒是为了等 kube-proxy/EndpointSlice 把本 Pod
+#     摘干净（这个传播是异步的），然后 SIGTERM 触发 server.shutdown=graceful，
+#     terminationGracePeriodSeconds=30 给在途请求留时间
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smartlib-backend
+  namespace: smartlib
+  labels:
+    app.kubernetes.io/name: smartlib-backend
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: smartlib
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: smartlib-backend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: smartlib-backend
+        app.kubernetes.io/component: backend
+        app.kubernetes.io/part-of: smartlib
+      annotations:
+        # 让 Prometheus 按 Pod 抓指标（如果有 prometheus-operator；没有也能留着）
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/actuator/prometheus"
+        prometheus.io/port: "8080"
+    spec:
+      # 停止接收新连接后等待在途请求完成（application.yml: server.shutdown=graceful）
+      terminationGracePeriodSeconds: 30
+      # 非 root、无特权：与 namespace 的 pod-security=restricted 对齐
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # 镜像拉取凭证（私有仓库时启用）
+      # imagePullSecrets:
+      #   - name: smartlib-registry
+      affinity:
+        podAntiAffinity:
+          # 软反亲和：尽量分散到不同节点；单节点集群仍可调度
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: smartlib-backend
+      containers:
+        - name: backend
+          # 镜像名由 kustomization.yaml 的 images 字段统一覆盖（tag 走 CI 产出）
+          image: smartlib/backend:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: smartlib-config
+            - secretRef:
+                name: smartlib-secret
+          env:
+            # 追踪采样率等可在此追加；此处显式声明 Pod 名，便于日志里定位实例
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              # requests 决定调度与 HPA 的 CPU 利用率分母，按稳态实测量给
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "1Gi"
+          # ---------------------------- 探针 ----------------------------------
+          startupProbe:
+            httpGet:
+              path: /actuator/health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30      # 15 + 30*5 = 最长 165s 冷启动窗口
+            successThreshold: 1
+          readinessProbe:
+            # Spring Boot 的 readiness 组：含 db/redis 依赖，依赖没就绪不接流量
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+            successThreshold: 1
+          livenessProbe:
+            # 只判断进程是否卡死：故意不含外部依赖
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+            successThreshold: 1
+          # ---------------------------- 优雅停机 ------------------------------
+          lifecycle:
+            preStop:
+              exec:
+                # 睡 5 秒等 EndpointSlice 传播完成，避免"连接还在往这个 Pod 打，
+                # 但进程已经不再 accept"造成的 502
+                command: ["/bin/sh", "-c", "sleep 5"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false   # JVM 需要写临时文件/work 目录
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

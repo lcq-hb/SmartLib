@@ -1,0 +1,29 @@
+# =============================================================================
+# SmartLib 后端 Service
+#
+# 类型选择：ClusterIP（不对外暴露）。
+#   对外入口由 Ingress（deploy/k8s/ingress.yaml）或集群外的 Nginx 承担，
+#   Service 只做集群内 L4 负载 + 稳定的 DNS 名（backend.smartlib.svc.cluster.local）。
+#
+# sessionAffinity: None 是刻意的：后端无状态（A1），不需要粘性会话；
+#   如果这里开了 ClientIP 粘性，反而会掩盖"某个实例有问题"的故障。
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: smartlib
+  labels:
+    app.kubernetes.io/name: smartlib-backend
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: smartlib
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: smartlib-backend
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+  sessionAffinity: None

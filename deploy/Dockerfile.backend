@@ -1,0 +1,91 @@
+# =============================================================================
+# SmartLib 后端镜像（Spring Boot 4.1.1 / Java 21）
+#
+# 构建（build context = deploy/ 目录，与 docker-compose.yml 的 context: . 一致）：
+#   cd deploy
+#   docker build -f Dockerfile.backend -t smartlib/backend:1.0.0 .
+#   # 或者直接：docker compose up -d --build
+#
+# 【重要】Docker 要求 Dockerfile 必须位于 build context 之内。
+#   本文件在 deploy/ 下，所以 context 必须也是 deploy/（compose 里写 context: .）。
+#   代价：Dockerfile 里的 COPY 只能写 context 内的相对路径（backend/...），
+#   因此本文件依赖「deploy/ 与 backend/ 是同级目录」这个仓库布局。
+#
+#   ⚠️ Docker 不允许 COPY ../backend/...（超出 context），
+#   所以「context = 仓库根 + Dockerfile 在 deploy/」这个组合在 Docker 里无法成立，
+#   必须二选一：
+#     A. context = deploy/（本文件当前做法，compose 已配好，开箱即用）
+#     B. 把 Dockerfile 复制/软链到仓库根目录，context = 仓库根，
+#        COPY 路径改成 backend/pom.xml、backend/src（与现在一致）
+#   两种做法的镜像内容完全相同，区别只在构建命令怎么写。
+#   变体 B 的具体命令见 deploy/README.md「已知限制」第 1 条。
+#
+# 设计要点：
+#   * 两阶段构建，运行镜像只带 JRE，镜像体积与攻击面都更小
+#   * 先 COPY pom.xml + go-offline 再 COPY src：改代码不会让依赖层失效（缓存命中）
+#   * 非 root 运行（uid 10001），配合 K8s securityContext.runAsNonRoot
+#   * MaxRAMPercentage=75 让 JVM 按容器 cgroup 限制自动算堆，避免被 OOMKill
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: 构建（Maven + JDK 21）
+# ---------------------------------------------------------------------------
+FROM maven:3.9-eclipse-temurin-21 AS builder
+
+WORKDIR /build
+
+# 依赖缓存层：只依赖 pom.xml。只要 pom 不变，这一层永远命中缓存。
+COPY backend/pom.xml ./pom.xml
+RUN --mount=type=cache,target=/root/.m2 \
+    mvn -B -ntp -q dependency:go-offline -DskipTests || \
+    mvn -B -ntp -q dependency:resolve -DskipTests
+
+# 源码层：改代码只重建这一层
+COPY backend/src ./src
+
+# -DskipTests：CI 已经单独跑 mvn test，镜像构建不重复跑
+# 产出：/build/app.jar（Spring Boot 可执行 fat jar）
+RUN --mount=type=cache,target=/root/.m2 \
+    mvn -B -ntp clean package -DskipTests \
+ && cp /build/target/*.jar /build/app.jar
+
+# 构建期自检：jar 必须存在且非空，否则让构建在这里失败而不是运行时才炸
+RUN test -s /build/app.jar && ls -lh /build/app.jar
+
+# ---------------------------------------------------------------------------
+# Stage 2: 运行（仅 JRE 21）
+# ---------------------------------------------------------------------------
+FROM eclipse-temurin:21-jre AS runtime
+
+# 时区与字符集：容器内 date/日志必须是东八区，中文日志不能乱码
+ENV TZ=Asia/Shanghai \
+    LANG=C.UTF-8
+
+# 非 root 用户：uid 固定 10001，方便 K8s runAsUser 对齐
+RUN groupadd --system --gid 10001 smartlib \
+ && useradd --system --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin smartlib \
+ && mkdir -p /app/logs \
+ && chown -R 10001:10001 /app
+
+WORKDIR /app
+
+# 只拷产物，不带 Maven / 源码 / .git
+COPY --from=builder --chown=10001:10001 /build/app.jar /app/app.jar
+
+USER 10001:10001
+
+EXPOSE 8080
+
+# 优雅停机：K8s preStop / docker stop 发 SIGTERM，
+# 配合 application.yml 的 server.shutdown=graceful 等在途请求跑完。
+STOPSIGNAL SIGTERM
+
+# exec 形式：java 直接是 PID 1，SIGTERM 能收到（shell 形式会变成 sh -c，信号丢失）
+ENTRYPOINT ["java", \
+    "-XX:MaxRAMPercentage=75", \
+    "-XX:+UseG1GC", \
+    "-XX:+ExitOnOutOfMemoryError", \
+    "-Dfile.encoding=UTF-8", \
+    "-Duser.timezone=Asia/Shanghai", \
+    "-Dspring.profiles.active=prod", \
+    "-jar", "/app/app.jar"]

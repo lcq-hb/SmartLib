@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<!--
+  SmartLib 书目检索映射。
+
+  设计要点：
+  1. 列清单集中在一个 <sql> 片段里，避免各查询之间列名漂移；
+  2. 排序字段用 <choose> 枚举固定子句，绝不使用 ${} 拼接，消除 ORDER BY 注入；
+  3. 分页统一使用 limit/offset（H2 MODE=MySQL 与 MySQL 8 语法一致）；
+  4. 所有可空条件都放在 <if> 中，保证命中索引的组合不会被多余的恒真条件破坏。
+-->
+<mapper namespace="com.smartlib.mapper.BookMapper">
+
+  <!-- book + book_stock + category 的联合投影，供检索结果/热门榜/推荐复用 -->
+  <sql id="rowColumns">
+    b.id            as id,
+    b.isbn          as isbn,
+    b.title         as title,
+    b.author        as author,
+    b.publisher     as publisher,
+    c.name          as category_name,
+    c.code          as category_code,
+    b.publish_year  as publish_year,
+    b.price         as price,
+    b.tags          as tags,
+    b.summary       as summary,
+    b.shelf_location as shelf_location,
+    s.total_copies  as total_copies,
+    s.available_copies as available_copies
+  </sql>
+
+  <sql id="rowJoins">
+    from book b
+    left join category c on c.id = b.category_id
+    left join book_stock s on s.book_id = b.id
+  </sql>
+
+  <insert id="insert" useGeneratedKeys="true" keyProperty="id"
+          parameterType="com.smartlib.domain.entity.Book">
+    insert into book(isbn, title, author, publisher, category_id, publish_year,
+                     price, tags, summary, shelf_location, total_copies, created_at, updated_at)
+    values(#{isbn}, #{title}, #{author}, #{publisher}, #{categoryId}, #{publishYear},
+           #{price}, #{tags}, #{summary}, #{shelfLocation}, #{totalCopies}, now(), now())
+  </insert>
+
+  <select id="findById" resultType="com.smartlib.domain.entity.Book">
+    select * from book where id = #{id}
+  </select>
+
+  <select id="findRowsByIds" resultType="com.smartlib.domain.dto.BookRow">
+    select <include refid="rowColumns"/>
+    <include refid="rowJoins"/>
+    where b.id in
+    <foreach collection="ids" item="bid" open="(" separator="," close=")">#{bid}</foreach>
+  </select>
+
+  <select id="findRowsByIdsOrdered" resultType="com.smartlib.domain.dto.BookRow">
+    select <include refid="rowColumns"/>
+    <include refid="rowJoins"/>
+    where b.id in
+    <foreach collection="ids" item="bid" open="(" separator="," close=")">#{bid}</foreach>
+    order by b.id asc
+  </select>
+
+  <!-- Q1 基线：like '%%'，无法使用索引，作为性能对比的参照组 -->
+  <select id="searchByLike" resultType="com.smartlib.domain.dto.BookRow">
+    select <include refid="rowColumns"/>
+    <include refid="rowJoins"/>
+    <include refid="likeWhere"/>
+    <include refid="orderBy"/>
+    limit #{q.size} offset #{q.offset}
+  </select>
+
+  <select id="countByLike" resultType="long">
+    select count(1)
+    <include refid="rowJoins"/>
+    <include refid="likeWhere"/>
+  </select>
+
+  <sql id="likeWhere">
+    <where>
+      <if test="q.hasQuery()">
+        and (
+          b.title like concat('%', #{q.query}, '%')
+          or b.author like concat('%', #{q.query}, '%')
+          or b.tags like concat('%', #{q.query}, '%')
+          or b.publisher like concat('%', #{q.query}, '%')
+          or b.isbn = #{q.query}
+        )
+      </if>
+      <if test="q.category != null">
+        and c.code = #{q.category}
+      </if>
+      <if test="q.publisher != null">
+        and b.publisher like concat('%', #{q.publisher}, '%')
+      </if>
+      <if test="q.yearFrom != null">
+        and b.publish_year &gt;= #{q.yearFrom}
+      </if>
+      <if test="q.yearTo != null">
+        and b.publish_year &lt;= #{q.yearTo}
+      </if>
+      <if test="q.availableOnly">
+        and s.available_copies &gt; 0
+      </if>
+    </where>
+  </sql>
+
+  <!-- 排序白名单：只枚举，不拼接用户输入 -->
+  <sql id="orderBy">
+    <choose>
+      <when test="q.sort == 'year_desc'">order by b.publish_year desc, b.id asc</when>
+      <when test="q.sort == 'year_asc'">order by b.publish_year asc, b.id asc</when>
+      <when test="q.sort == 'price_asc'">order by b.price asc, b.id asc</when>
+      <when test="q.sort == 'price_desc'">order by b.price desc, b.id asc</when>
+      <otherwise>order by b.id asc</otherwise>
+    </choose>
+  </sql>
+
+  <select id="selectPageForIndex" resultType="com.smartlib.domain.dto.BookRow">
+    select <include refid="rowColumns"/>
+    <include refid="rowJoins"/>
+    order by b.id asc
+    limit #{limit} offset #{offset}
+  </select>
+
+  <!-- 热门榜：近 N 天借阅次数，配合 lent 记录做窗口统计 -->
+  <select id="findHot" resultType="com.smartlib.domain.dto.BookRow">
+    select <include refid="rowColumns"/>,
+           coalesce(h.cnt, 0) as hot_score
+    <include refid="rowJoins"/>
+    left join (
+      select br.book_id as book_id, count(1) as cnt
+        from borrow_record br
+       where br.borrow_at &gt;= #{since}
+       group by br.book_id
+    ) h on h.book_id = b.id
+    order by coalesce(h.cnt, 0) desc, s.available_copies desc, b.id asc
+    limit #{limit}
+  </select>
+
+  <select id="findSimilar" resultType="com.smartlib.domain.dto.BookRow">
+    select <include refid="rowColumns"/>,
+           coalesce(h.cnt, 0) as hot_score
+    <include refid="rowJoins"/>
+    left join (
+      select br.book_id as book_id, count(1) as cnt
+        from borrow_record br
+       where br.borrow_at &gt;= #{since}
+       group by br.book_id
+    ) h on h.book_id = b.id
+    where b.category_id = #{categoryId}
+    <if test="excludeIds != null and excludeIds.size() &gt; 0">
+      and b.id not in
+      <foreach collection="excludeIds" item="eid" open="(" separator="," close=")">#{eid}</foreach>
+    </if>
+    order by coalesce(h.cnt, 0) desc, b.publish_year desc, b.id asc
+    limit #{limit}
+  </select>
+
+  <!--
+    协同过滤召回：借过目标书的读者，还借过哪些书。
+    用 inner join 而不是 or，确保"同一读者"这个条件成立；
+    排除目标书自身；按共现读者数降序取 TopN。
+  -->
+  <select id="findCoBorrowed" resultType="com.smartlib.domain.dto.BookRow">
+    select <include refid="rowColumns"/>,
+           coalesce(co.cnt, 0) as hot_score
+    <include refid="rowJoins"/>
+    join (
+      select br2.book_id as book_id, count(distinct br2.reader_id) as cnt
+        from borrow_record br1
+        join borrow_record br2 on br2.reader_id = br1.reader_id and br2.book_id &lt;&gt; br1.book_id
+       where br1.book_id = #{bookId}
+       group by br2.book_id
+       order by count(distinct br2.reader_id) desc
+       limit #{limit}
+    ) co on co.book_id = b.id
+    order by coalesce(co.cnt, 0) desc, b.id asc
+  </select>
+
+</mapper>

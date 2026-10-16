@@ -1,0 +1,109 @@
+# =============================================================================
+# SmartLib HPA（水平自动扩缩容）
+#
+# 目标：检索峰值 300 QPS（§1.1）时自动扩容，夜间回落到 2 副本省资源。
+#
+# 为什么 CPU 70% 是合理的默认：
+#   * requests.cpu = 250m，70% 即单 Pod 平均 175m 时触发扩容
+#   * 后端是 IO 密集 + CPU 密集混合；如果实测发现 CPU 上不去但延迟已经劣化
+#     （典型的等待行锁场景），应该改挂【自定义指标】而不是继续调 CPU 阈值：
+#       - metrics: Pods / smartlib_stock_deduct_seconds (Micrometer 暴露到 Prometheus)
+#       - 或 external metric: mysql_innodb_row_lock_time_avg
+#     这正是 §6.1 "S2 高并发下锁竞争" 要在压测里观察的指标。
+#
+# 扩容行为说明：
+#   behavior.scaleUp 故意激进（30s 内可翻倍、每 30s 加 2 个），
+#   scaleDown 故意保守（5 分钟稳定窗口、每分钟最多减 1 个），
+#   避免"扩了又缩、缩了又扩"的抖动把 JVM 反复冷启动。
+# =============================================================================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: smartlib-backend
+  namespace: smartlib
+  labels:
+    app.kubernetes.io/name: smartlib-backend
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: smartlib
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: smartlib-backend
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    # 内存指标：JVM 堆有 -XX:MaxRAMPercentage=75，内存利用率本身不该触发扩容
+    # （堆占用高是正常的），所以这里只做"参考"不参与扩容决策。
+    # 需要时打开下面这段（注意两个指标是 OR 关系，任一满足即扩容）：
+    # - type: Resource
+    #   resource:
+    #     name: memory
+    #     target:
+    #       type: Utilization
+    #       averageUtilization: 85
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+      selectPolicy: Min
+---
+# Agent 服务同理：它的瓶颈通常是 LLM 调用的等待时间（IO 密集），
+# CPU 阈值设得更高（75%），并且副本上限更小（LLM 有并发配额限制）。
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: smartlib-agent
+  namespace: smartlib
+  labels:
+    app.kubernetes.io/name: smartlib-agent
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: smartlib
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: smartlib-agent
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+      selectPolicy: Min

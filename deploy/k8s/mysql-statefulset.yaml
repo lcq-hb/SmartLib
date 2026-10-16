@@ -1,0 +1,169 @@
+# =============================================================================
+# SmartLib MySQL StatefulSet（单副本 + 稳定网络标识 + 持久卷）
+#
+# 为什么用 StatefulSet 而不是 Deployment：
+#   * 有状态：需要稳定的 Pod 名（mysql-0）与 PVC 绑定关系，重建后仍挂同一块盘
+#   * 有序：StatefulSet 保证"先有存储再有 Pod"，避免 Pod 起来了盘还没挂上
+#
+# 生产演进（本清单是单实例基线，够简历项目演示；真生产不要停在这里）：
+#   1) 主从复制：MySQL 8 的 Group Replication / InnoDB Cluster（3 节点起）
+#   2) 或者干脆托管：云 RDS / Aurora，把 DB 从 K8s 里拿出去
+#   3) 备份：XtraBackup 定时 + binlog 归档，RPO 目标写进 docs/07 部署手册
+#   4) 初始化脚本：本清单用 ConfigMap 挂 01/02/03 三个 SQL，
+#      生产应改为 Job 显式执行（可观测、可重试、不依赖"数据目录为空"这个隐含条件）
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smartlib-mysql-init
+  namespace: smartlib
+  labels:
+    app.kubernetes.io/name: smartlib-mysql
+    app.kubernetes.io/component: database
+data:
+  # 说明：这里放的是"占位的最小可运行版本"。
+  # 真正部署时应与 deploy/sql/ 下的三个文件保持一致，推荐做法：
+  #   kubectl -n smartlib create configmap smartlib-mysql-init \
+  #     --from-file=01-schema.sql=deploy/sql/01-schema.sql \
+  #     --from-file=02-seed.sql=deploy/sql/02-seed.sql \
+  #     --from-file=03-mysql-production-extras.sql=deploy/sql/mysql-production-extras.sql
+  # 再用 --dry-run=client -o yaml 覆盖此处，避免同一个 DDL 维护两份。
+  00-note.sql: |
+    -- 占位：请用 deploy/sql/ 下的 01/02/03 三个文件生成真正的 ConfigMap
+    -- （命令见 deploy/k8s/mysql-statefulset.yaml 顶部注释）。
+    -- 保留这个 key 只是为了让 ConfigMap 对象合法（data 不能为空）。
+    SELECT 'SmartLib MySQL init placeholders - replace with deploy/sql/*.sql' AS notice;
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: smartlib
+  labels:
+    app.kubernetes.io/name: smartlib-mysql
+    app.kubernetes.io/component: database
+spec:
+  # headless：StatefulSet 需要稳定的 DNS 名 mysql-0.mysql.smartlib.svc.cluster.local
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: smartlib-mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: smartlib
+  labels:
+    app.kubernetes.io/name: smartlib-mysql
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: smartlib
+spec:
+  serviceName: mysql
+  replicas: 1
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: smartlib-mysql
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: smartlib-mysql
+        app.kubernetes.io/component: database
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        fsGroup: 999        # mysql 镜像里 mysql 用户的 gid，保证 PVC 可写
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --character-set-server=utf8mb4
+            - --collation-server=utf8mb4_0900_ai_ci
+            - --default-time-zone=+08:00
+            - --ngram_token_size=2
+            - --max-connections=500
+            - --innodb-buffer-pool-size=512M
+            - --slow-query-log=1
+            - --long-query-time=0.5
+          ports:
+            - name: mysql
+              containerPort: 3306
+              protocol: TCP
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: smartlib-secret
+                  key: MYSQL_ROOT_PASSWORD
+            - name: MYSQL_DATABASE
+              valueFrom:
+                configMapKeyRef:
+                  name: smartlib-config
+                  key: MYSQL_DATABASE
+            - name: MYSQL_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: smartlib-config
+                  key: MYSQL_USER
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: smartlib-secret
+                  key: MYSQL_PASSWORD
+            - name: TZ
+              value: Asia/Shanghai
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - mysqladmin ping -h 127.0.0.1 -uroot -p"$MYSQL_ROOT_PASSWORD" --silent
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - mysqladmin ping -h 127.0.0.1 -uroot -p"$MYSQL_ROOT_PASSWORD" --silent
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+      volumes:
+        - name: init
+          configMap:
+            name: smartlib-mysql-init
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: smartlib-mysql
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # storageClassName 留空 = 用集群默认 StorageClass；
+        # 需要指定时填（如 local-path / gp3 / alicloud-disk-essd）
+        # storageClassName: standard
+        resources:
+          requests:
+            storage: 20Gi

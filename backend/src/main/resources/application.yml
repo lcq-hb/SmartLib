@@ -1,0 +1,124 @@
+spring:
+  application:
+    name: smartlib-backend
+  profiles:
+    active: local
+  # Spring Boot 4 使用 Jackson 3，java.time 类型默认序列化为 ISO-8601 字符串，
+  # 无需再配置 write-dates-as-timestamps；此处只保留时区设置。
+  jackson:
+    time-zone: Asia/Shanghai
+
+server:
+  port: 8080
+  # 优雅停机：收到 SIGTERM 后停止接收新请求，等待在途请求完成（配合 K8s preStop 使用）
+  shutdown: graceful
+  tomcat:
+    threads:
+      max: 200
+      min-spare: 20
+    accept-count: 200
+    max-connections: 10000
+
+spring.lifecycle.timeout-per-shutdown-phase: 20s
+
+mybatis:
+  mapper-locations: classpath:mapper/*.xml
+  type-aliases-package: com.smartlib.domain.entity
+  configuration:
+    map-underscore-to-camel-case: true
+    default-fetch-size: 100
+    default-statement-timeout: 5
+
+# =============================================================================
+# SmartLib 业务配置
+# =============================================================================
+smartlib:
+  # 库存扣减策略：local-lock | optimistic-db | pessimistic-db | version-retry | redis-lua | mq-serial
+  # 默认 optimistic-db：依赖数据库条件更新保证正确性，不引入额外组件，见 ADR-004
+  stock:
+    strategy: optimistic-db
+    # redis-lua 策略不可用时是否自动降级为 optimistic-db（生产必须为 true）
+    degrade-on-redis-failure: true
+    mq:
+      queue-capacity: 20000
+      timeout-ms: 3000
+
+  # 检索引擎：like | inverted-index | elasticsearch
+  search:
+    engine: inverted-index
+    index:
+      # 启动时最多加载多少书目进内存倒排索引（0 表示不限制）
+      max-docs: 500000
+      build-on-startup: true
+    elasticsearch:
+      base-url: http://localhost:9200
+      index-name: smartlib_book
+    cache:
+      # L1 本地缓存
+      l1-max-size: 10000
+      l1-ttl-seconds: 300
+      # L2 Redis 缓存
+      l2-ttl-seconds: 1800
+      # TTL 随机抖动比例，防缓存雪崩
+      ttl-jitter-ratio: 0.1
+      # 布隆过滤器：预计元素数与可接受误判率
+      bloom-expected-insertions: 1200000
+      bloom-fpp: 0.001
+
+  # 入口限流（令牌桶）
+  rate-limit:
+    enabled: true
+    capacity: 400
+    refill-per-second: 400
+
+  # 熔断降级
+  circuit-breaker:
+    failure-rate-threshold: 0.5
+    minimum-calls: 20
+    open-duration-seconds: 10
+    half-open-probes: 3
+
+  # 内部接口签名（Agent 服务调用 /internal/** 时校验 HMAC-SHA256）
+  internal:
+    sign-secret: ${SMARTLIB_INTERNAL_SIGN:dev-internal-secret-please-change}
+    sign-enabled: true
+    timestamp-tolerance-seconds: 300
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+  health:
+    # Redis 健康检查刻意关闭，原因是一个架构判断：
+    #   本项目对 Redis 的设计是"可降级"——缓存读失败就回源数据库，
+    #   库存扣减失败就退化为数据库条件更新（且因为条件更新兜底，超卖数仍为 0）。
+    #   如果让 Redis 参与 /actuator/health，那么 Redis 一挂，
+    #   readiness 探针就会失败，K8s 会把所有实例摘出负载均衡 ——
+    #   结果是"一个设计上能扛住的故障"被放大成"整个服务不可用"，
+    #   恰好抵消了降级设计的价值。
+    #   Redis 的可用性改由应用级指标告警监控：
+    #   smartlib.cache.l2{result="error"}、smartlib.stock.deduct 的降级计数。
+    redis:
+      enabled: false
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+logging:
+  level:
+    root: INFO
+    com.smartlib: DEBUG
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level [%X{traceId:-}] %logger{36} - %msg%n"

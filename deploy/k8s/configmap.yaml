@@ -1,0 +1,54 @@
+# =============================================================================
+# SmartLib 非敏感配置（ConfigMap）
+#
+# 划分原则（与 §5 数据模型 / application-prod.yml 的占位符一一对应）：
+#   * ConfigMap：主机名、端口、库名、策略名、开关 —— 泄露了也不致命
+#   * Secret   ：密码、HMAC 密钥 —— 见 secret.yaml.example
+#
+# 与 Spring Boot 的映射关系（relaxed binding）：
+#   MYSQL_HOST          -> ${MYSQL_HOST:mysql}          （application-prod.yml 里显式引用）
+#   SMARTLIB_STOCK_STRATEGY -> smartlib.stock.strategy  （下划线转点，大小写不敏感）
+#   SEARCH_ENGINE       -> smartlib.search.engine
+#   SMARTLIB_ADMIN_ENABLED -> smartlib.admin.enabled    （压测需要运行期切策略）
+#
+# 注意：K8s 的 env 一旦显式声明某个变量，就不会再去读 ConfigMap 里同名 key，
+#       因此 configMapKeyRef 的 key 名与这里的 key 名必须完全一致。
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: smartlib-config
+  namespace: smartlib
+  labels:
+    app.kubernetes.io/name: smartlib
+    app.kubernetes.io/component: config
+data:
+  # ---------------------------- 通用 ----------------------------------------
+  SPRING_PROFILES_ACTIVE: "prod"
+  TZ: "Asia/Shanghai"
+  JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai"
+
+  # ---------------------------- MySQL ---------------------------------------
+  MYSQL_HOST: "mysql.smartlib.svc.cluster.local"
+  MYSQL_PORT: "3306"
+  MYSQL_DATABASE: "smartlib"
+  MYSQL_USER: "smartlib_app"
+
+  # ---------------------------- Redis ---------------------------------------
+  REDIS_HOST: "redis.smartlib.svc.cluster.local"
+  REDIS_PORT: "6379"
+
+  # ---------------------------- 业务策略 ------------------------------------
+  # 库存扣减策略合法值：local-lock | optimistic-db | pessimistic-db |
+  #                      version-retry | redis-lua | mq-serial
+  SMARTLIB_STOCK_STRATEGY: "redis-lua"
+  # 检索引擎合法值：like | inverted-index | elasticsearch
+  SEARCH_ENGINE: "inverted-index"
+  # 压测/演示时用 /api/admin/stock-strategy 运行期切策略；生产应改回 false
+  SMARTLIB_ADMIN_ENABLED: "true"
+
+  # ---------------------------- Agent 服务 ----------------------------------
+  LLM_PROVIDER: "mock"
+  SMARTLIB_BACKEND_BASE_URL: "http://backend.smartlib.svc.cluster.local:8080"
+  LOG_LEVEL: "INFO"
+  UVICORN_WORKERS: "2"

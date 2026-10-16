@@ -1,0 +1,76 @@
+# =============================================================================
+# SmartLib EditorConfig
+# 目的：Java / Python / SQL / YAML / PowerShell 混排仓库里，保证换行、缩进、
+#       编码三项在 Windows 与 Linux/CI 上完全一致（避免 CRLF 触发无意义 diff）。
+# 说明：仓库以 Windows 为主要开发环境，本文件强制 LF + UTF-8，Git 侧建议
+#       配合 `git config core.autocrlf input`（见 deploy/README.md）。
+# =============================================================================
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+max_line_length = 120
+
+# ---------------------------- Java ------------------------------------------
+[*.java]
+indent_size = 4
+max_line_length = 120
+
+# ---------------------------- Python ----------------------------------------
+[*.py]
+indent_size = 4
+max_line_length = 120
+# Python 的隐式字符串拼接与格式化字符串中，尾随空白并非总能安全裁剪
+trim_trailing_whitespace = false
+
+# ---------------------------- SQL -------------------------------------------
+[*.sql]
+indent_size = 4
+# DDL 里的对齐注释有阅读价值，允许较长的行
+max_line_length = 200
+
+# ---------------------------- 配置 / 数据 -----------------------------------
+[*.{yml,yaml,json}]
+indent_size = 2
+# JSON 数据集（recall_dataset.json）由脚本读取，缩进统一 2 空格便于人工标注
+insert_final_newline = true
+
+[*.{xml,html}]
+indent_size = 2
+
+[*.{js,ts,css,scss}]
+indent_size = 2
+
+# ---------------------------- 脚本 ------------------------------------------
+# PowerShell 约定 4 空格；Makefile 必须用 TAB
+[*.{ps1,psm1}]
+indent_size = 4
+
+[*.sh]
+indent_size = 2
+
+[Makefile]
+indent_style = tab
+indent_size = 4
+
+[*.md]
+# Markdown 里两个空格是"硬换行"，必须保留
+trim_trailing_whitespace = false
+max_line_length = off
+
+# ---------------------------- Docker / Nginx ---------------------------------
+# nginx.conf 花括号层级靠缩进体现，统一 4 空格
+[Dockerfile*]
+indent_size = 4
+
+[*.conf]
+indent_size = 4
+
+[*.{bat,cmd}]
+end_of_line = crlf
+indent_size = 2

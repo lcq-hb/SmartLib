@@ -1,0 +1,139 @@
+# =============================================================================
+# SmartLib CI —— 后端(Java/Maven) + Agent(Python/pytest)
+#
+# 设计说明（都是踩过的坑，写下来避免以后改回去）：
+#   1) 两个 job 相互独立、并行跑：后端挂了不影响 Agent 的反馈速度。
+#   2) 【路径过滤】只有相关目录变化才触发，避免改文档就烧掉 CI 额度。
+#      注意：如果把这个仓库做成"必需检查(required status check)"，
+#      path 过滤会让"未触发"的 job 永远显示 pending，那种场景请去掉 paths。
+#   3) 后端用 ubuntu-latest 上的标准 mvn，而不是仓库里的 scripts/mvn.ps1：
+#      那个脚本是给 Windows 中文路径用的（直接调 classworlds 绕开 cmd.exe 代码页），
+#      在 Linux runner 上没有意义，而且 Linux 上 mvn 的参数传递本来就正常。
+#   4) 用 actions/setup-java 的 cache: maven + cache-dependency-path 指向 pom.xml，
+#      缓存的是 ~/.m2/repository（runner 上没有 .tools/m2repo 这个仓库隔离目录）。
+#   5) 【不是本文件职责的事】Docker 镜像构建与推送、Compose 起环境冒烟、
+#      压测（scripts/bench）都不放在 CI：压测需要稳定的机器与真实数据量，
+#      数字放进 CI 只会变成噪声。压测请按 docs/06 的流程在本机/压测机上手工跑。
+# =============================================================================
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "backend/**"
+      - "agent-service/**"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    branches: ["**"]
+    paths:
+      - "backend/**"
+      - "agent-service/**"
+      - ".github/workflows/ci.yml"
+  # 允许在 Actions 页面手工触发（排查环境问题时很有用）
+  workflow_dispatch:
+
+# 同一分支的旧流水线自动取消，节省额度
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ===========================================================================
+  # 后端：编译 + 测试（含并发借阅/策略单测）
+  # ===========================================================================
+  backend:
+    name: backend (Java 21 + Maven)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          # pom.xml 的 <java.version>21</java.version>，用 21 与生产镜像(maven:3.9-eclipse-temurin-21)对齐
+          java-version: "21"
+          cache: maven
+          # 缓存 key 依赖这个文件，pom 变了自动失效重建
+          cache-dependency-path: backend/pom.xml
+
+      - name: Show toolchain versions
+        run: |
+          java -version
+          mvn -version
+
+      - name: Maven test
+        working-directory: backend
+        # -B 批处理模式（日志无进度条），-ntp 去掉 "Downloading..." 噪声，
+        # --no-transfer-progress 与 -ntp 等价，保留一个即可
+        run: mvn -B -ntp test
+
+      - name: Upload surefire reports
+        # 失败时把测试报告留下来，否则只能靠日志猜是哪条用例挂了
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-surefire-reports
+          path: backend/target/surefire-reports/**
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload test summary (optional file)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-jar
+          path: backend/target/*.jar
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ===========================================================================
+  # Agent：依赖安装 + pytest
+  # ===========================================================================
+  agent:
+    name: agent (Python 3.12 + pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: agent-service/requirements.txt
+
+      - name: Install dependencies
+        working-directory: agent-service
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pytest
+        working-directory: agent-service
+        # LLM_PROVIDER=mock：CI 里没有 API Key，必须走 MockLLM 才能全绿
+        env:
+          LLM_PROVIDER: mock
+          SMARTLIB_BACKEND_BASE_URL: http://127.0.0.1:8080
+        run: python -m pytest -q
+
+      - name: Upload pytest artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-test-artifacts
+          path: |
+            agent-service/.pytest_cache/**
+            agent-service/eval/report.json
+          if-no-files-found: ignore
+          retention-days: 7

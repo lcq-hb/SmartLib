@@ -1,0 +1,137 @@
+# =============================================================================
+# SmartLib Redis Deployment（单副本 + AOF）
+#
+# 为什么用 Deployment 而不是 StatefulSet：
+#   Redis 在本项目里是【可降级的加速层】，不是唯一事实源
+#   （§6.5：库存永不以缓存为唯一事实源）。它挂掉时后端会自动降级到
+#   数据库条件更新（DegradeFallback），所以不需要 StatefulSet 那套稳定标识。
+#
+# 注意：redis-lua 策略下 Redis 里存着"已预扣未落库"的量，
+#   因此 appendonly yes + everysec 是必须的（丢最多 1 秒），
+#   同时后端必须有补偿任务把 locked_copies 收敛回 available_copies。
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: smartlib
+  labels:
+    app.kubernetes.io/name: smartlib-redis
+    app.kubernetes.io/component: cache
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: smartlib-redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smartlib-redis
+  namespace: smartlib
+  labels:
+    app.kubernetes.io/name: smartlib-redis
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/part-of: smartlib
+spec:
+  # 单副本：本项目 Redis 不做集群。要上集群请用 Sentinel/Cluster 专用清单，
+  # 并把后端 application-prod.yml 的 host/port 改成哨兵模式。
+  replicas: 1
+  strategy:
+    # 缓存实例重建即可，不需要滚动（RWO 卷也不支持多 Pod 同时挂）
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: smartlib-redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: smartlib-redis
+        app.kubernetes.io/component: cache
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999      # redis:7-alpine 镜像内的 redis 用户
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          args:
+            - redis-server
+            - --appendonly
+            - "yes"
+            - --appendfsync
+            - everysec
+            - --maxmemory
+            - 512mb
+            - --maxmemory-policy
+            - allkeys-lru
+            - --dir
+            - /data
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "768Mi"
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 5
+          lifecycle:
+            preStop:
+              exec:
+                # 先把 AOF 落盘再退出，避免重启后丢预扣量
+                command: ["redis-cli", "shutdown", "save"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: smartlib-redis-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: smartlib-redis-data
+  namespace: smartlib
+  labels:
+    app.kubernetes.io/name: smartlib-redis
+    app.kubernetes.io/component: cache
+spec:
+  accessModes: ["ReadWriteOnce"]
+  # storageClassName 留空 = 使用集群默认 StorageClass
+  # storageClassName: standard
+  resources:
+    requests:
+      storage: 5Gi

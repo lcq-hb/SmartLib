@@ -1,0 +1,91 @@
+# =============================================================================
+# SmartLib Kustomize 编排
+#
+# 用法：
+#   # 预览最终 YAML（不改集群）
+#   kubectl kustomize deploy/k8s
+#   # 服务端试算（校验 schema 与权限）
+#   kubectl apply -k deploy/k8s --dry-run=server
+#   # 真正部署
+#   kubectl apply -k deploy/k8s
+#   # 删除（PVC 不会被删，数据保留）
+#   kubectl delete -k deploy/k8s
+#
+# 【部署顺序】kustomize 一次 apply 全部资源，K8s 自己会按依赖重试收敛：
+#   1) namespace + configmap + secret
+#   2) mysql StatefulSet（后端起不来会 CrashLoop，等 MySQL Ready 后自然恢复）
+#   3) redis
+#   4) backend / agent Deployment + Service
+#   5) ingress + hpa
+# 如果不想看到中间的 CrashLoopBackOff，可以分两次 apply（先基础设施后应用），
+# 命令见 deploy/README.md。
+#
+# 【必须先做】真实 Secret 不在本清单里（secret.yaml 被 gitignore），
+#   部署前必须：
+#     kubectl -n smartlib create secret generic smartlib-secret \
+#       --from-literal=MYSQL_ROOT_PASSWORD=... \
+#       --from-literal=MYSQL_PASSWORD=... \
+#       --from-literal=REDIS_PASSWORD= \
+#       --from-literal=SMARTLIB_INTERNAL_SIGN=...
+#   或者 cp secret.yaml.example secret.yaml 填好后 apply。
+# =============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# 统一命名空间：所有资源不带 namespace 字段也能落到 smartlib
+namespace: smartlib
+
+# 统一标签：kubectl get all -l app.kubernetes.io/part-of=smartlib 一次捞全
+commonLabels:
+  app.kubernetes.io/part-of: smartlib
+  app.kubernetes.io/managed-by: kustomize
+
+resources:
+  # ---------------------------- 基础 ----------------------------------------
+  - namespace.yaml
+  - configmap.yaml
+  # secret.yaml 刻意不在列表里：真实密钥不入库。
+  # 部署前用 secret.yaml.example 生成，或直接用 kubectl create secret 创建。
+  # - secret.yaml
+
+  # ---------------------------- 数据层 --------------------------------------
+  - mysql-statefulset.yaml
+  - redis-deployment.yaml
+
+  # ---------------------------- 应用层 --------------------------------------
+  - backend-deployment.yaml
+  - backend-service.yaml
+  - agent-deployment.yaml
+  - agent-service.yaml
+
+  # ---------------------------- 入口与弹性 ----------------------------------
+  - ingress.yaml
+  - hpa.yaml
+
+# 镜像版本统一在这里改（CI 用 `kustomize edit set image` 自动更新 tag）：
+#   cd deploy/k8s && kustomize edit set image smartlib/backend=registry.example.com/smartlib/backend:1.2.3
+images:
+  - name: smartlib/backend
+    newTag: "1.0.0"
+  - name: smartlib/agent
+    newTag: "1.0.0"
+
+# 生成器：也可以用 configMapGenerator 从 deploy/sql/ 直接生成 MySQL 初始化 ConfigMap，
+# 这样就不需要 mysql-statefulset.yaml 里的占位 ConfigMap 了。示例：
+#   configMapGenerator:
+#     - name: smartlib-mysql-init
+#       namespace: smartlib
+#       files:
+#         - 01-schema.sql=../sql/01-schema.sql
+#         - 02-seed.sql=../sql/02-seed.sql
+#         - 03-mysql-production-extras.sql=../sql/mysql-production-extras.sql
+#       options:
+#         disableNameSuffixHash: true   # 加 hash 会让 StatefulSet 引用的名字对不上
+# 注意：启用上面这段时要先把 mysql-statefulset.yaml 里的 ConfigMap 对象删掉，否则重名冲突。
+
+# 生产环境的差异化补丁示例（本仓库只保留注释，避免出现引用不到的文件）：
+# patches:
+#   - path: patch-prod-resources.yaml
+#     target:
+#       kind: Deployment
+#       name: smartlib-backend

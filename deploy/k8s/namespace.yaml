@@ -1,0 +1,19 @@
+# =============================================================================
+# SmartLib 命名空间
+# 应用：kubectl apply -f deploy/k8s/namespace.yaml
+# 说明：生产多环境（dev/staging/prod）建议用 smartlib-dev / smartlib-staging /
+#       smartlib-prod 三个 namespace，并把同一份清单通过 kustomization 的
+#       namespace 字段覆盖，而不是复制三份 YAML。
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: smartlib
+  labels:
+    app.kubernetes.io/name: smartlib
+    app.kubernetes.io/part-of: smartlib
+    app.kubernetes.io/managed-by: kustomize
+    # Pod Security Admission：限制特权容器（本项目全部非 root、无特权需求）
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
