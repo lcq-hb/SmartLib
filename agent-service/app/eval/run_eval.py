@@ -361,11 +361,32 @@ async def evaluate(args: argparse.Namespace) -> int:
     REPORT.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("-" * 88)
-    print(markdown)
+    safe_print(markdown)
     print("-" * 88)
-    print(f"报告已写入：{REPORT}")
+    safe_print(f"报告已写入：{REPORT}")
     await java.aclose()
     return 0 if not failures else 1
+
+
+def safe_print(text: str) -> None:
+    """按当前控制台编码安全输出，替换掉无法表示的字符。
+
+    为什么需要它：这个脚本在中文 Windows 上会以 GBK 输出 stdout。
+    报告里只要有任何一个 GBK 编不出来的字符（emoji、✅/❌、某些箭头），
+    `print` 就会直接抛 UnicodeEncodeError，**整份报告一个字都打不出来**，
+    而且退出码是非零，看起来像"评测失败"——实际只是打印挂了。
+    本项目真实踩过这个坑（`print(markdown)` 崩在 U+2705 上）。
+
+    两个措施配合使用：
+      1. 报告内的装饰性符号统一改成 GBK 可编码的写法（见 metrics.py）；
+      2. 这里再用 errors="replace" 兜底，保证以后新增任何字符都不会让报告崩掉。
+    """
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        text.encode(encoding)
+        print(text)
+    except (UnicodeEncodeError, LookupError):
+        print(text.encode(encoding, errors="replace").decode(encoding, errors="replace"))
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

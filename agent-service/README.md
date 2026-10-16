@@ -360,24 +360,92 @@ agent-service/
 
 ---
 
-## 10. 已知限制与未验证项
+## 10. 反幻觉硬约束：book_id 只能来自工具（G-13）
+
+这是**真实联调暴露并修复**的一条核心不变式，单独写一节。
+
+### 现象
+
+联调时 `《计算机网络》还有几本？` 与 `帮我借《算法导论》` 都失败，Java 侧日志：
+
+```
+WARN GlobalExceptionHandler - 业务异常 code=2002 msg=图书不存在：id=102
+WARN GlobalExceptionHandler - 业务异常 code=2002 msg=图书不存在：id=101
+```
+
+### 根因
+
+`MockLLM` 曾用一张"书名 → id"的本地表**直接产出 `book_id`**，而表里的
+`101/102` 只是离线假数据的 id —— 真实后端是 `算法导论=5`、`计算机网络=3`。
+模型（无论 Mock 还是真实 LLM）都可能编出后端不存在的 id，这类缺陷**必然发生**。
+
+### 修复（三层，缺一不可）
+
+1. **运行时不变式**：`book_id` 的唯一合法来源是**工具结果**。
+   `AgentRuntime._resolve_book_id` 只从 `search_books` 的候选里取，支持三种指代：
+   显式书名（容忍"（第3版）"这类模糊）、序数（"第 2 本"）、唯一结果直接采用。
+2. **模型给的 id 一律丢弃**：拿到模型参数时剥掉 `book_id`/`bookId`，
+   并记一次 `unsourced_book_id_blocked` 计量（`/admin/metrics` 可见
+   "模型到底编了多少次"）。
+3. **前置核验**：执行 `get_stock`/`borrow` 前若没有可信 id，自动补一次
+   `search_books`（标记 `internal=true`）；借书前再补一次 `get_stock` 确认
+   **实时**可借复本。拿不到候选时如实回答"没找到这本书"，
+   **绝不带着猜测的 id 去调后端**。
+
+MockLLM 也不再产出任何 `book_id` —— 它只表达"书名"意图，与真实 LLM 走
+**同一条**解析路径，离线测出来的行为对线上才有参考价值。
+
+### 配套写操作护栏（G-13_write_needs_prerequisite）
+
+拿不到"这本书存在且有馆藏"的证据时，**不允许**把写操作当成"待确认"抛给读者
+—— 否则读者确认之后必然失败。原先的表现正是"404 之后仍在追问
+'要我现在就为您办理借阅吗'"。现在这种情况会如实告知并停止。
+
+### 工具结果字段归一化（联调实测的真实字段名）
+
+| 接口 | 蓝图 §8.2 写的 | 真实后端返回 | Agent 处理 |
+|---|---|---|---|
+| `search-books` | 未明确主键名 | `items[].id` | `bookId`/`book_id`/`id` 都归一化 |
+| `books/{id}/stock` | `available,total` | `availableCopies,totalCopies` | 两种都兼容 |
+| `borrow` | `dueDate` | `dueAt` | 两种都兼容 |
+| `renew` | `newDueDate` | `newDueAt` | 两种都兼容 |
+| `readers/{id}/loans` | `dueDate` | `dueAt` | 两种都兼容 |
+
+### 响应结构
+
+`/chat/sync` 与 SSE `done` 都带 `schema_version`（当前 `1.1.0`）。
+`tool_calls` **只含读者要求的那次调用**；运行时内部补的步骤在
+`/admin/traces/{trace_id}` 的 `internal_tool_calls` 里可查。
+
+真机自检脚本：`python scripts/live_check.py --reader-id 3`（需先起 Java 后端）。
+
+---
+
+## 11. 已知限制与未验证项
 
 诚实清单（写清楚比藏起来有用）：
 
-1. **未与真实 Java 后端联调**：仓库里目前没有 `AgentToolController`，
-   全部接口调用都是按蓝图 §8.2 契约 + `httpx.MockTransport` 验证的。
-   真实联调需要确认的几处：
-   - `/internal/agent/tools/books/{id}/similar` 与 `.../books/hot`（recommend 依赖的
-     两条桥接路径，蓝图 §8.2 未单列，默认由后端桥接到公开的 `/api/books/{id}/similar`
-     与 `/api/books/hot`）；
-   - 统一响应体字段名（`availableCopies` / `shelfLocation` 等的下划线/驼峰写法，
-     `search_books` 与 `get_stock` 已做归一化兼容）。
+1. **已完成真机联调，但仍有未覆盖的部分**：已用真实 Java 后端（8080）+ Agent（8000）
+   跑通以下链路：
+   - 中文 query 的 HMAC 签名端到端通过（`search-books`、`books/{id}/stock` 均 200）；
+   - `《算法导论》还有几本` → 内部检索解析出真实 `book_id=5` → 库存返回
+     "馆藏 4 册，当前可借 3 册，三楼东区 TP301/233"；
+   - `帮我借《算法导论》` → 库存核验通过 → 待确认 → `确认借阅` 真正落库
+     （借阅记录号 1023，应还日期由后端给出）。
+   **仍未逐一验证**（有联调环境时应补）：
+   - `renew` 的真实续借（`newDueAt` 已做字段兼容但未实跑）；
+   - `policy_qa` 的 `/internal/agent/tools/policy` 真实规则库应答；
+   - `/internal/agent/tools/books/{id}/similar` 与 `.../books/hot`（recommend 依赖，
+     蓝图 §8.2 未单列）；
+   - 真实库的读者 id 是 1/2/3（不是 1001/1002），`readerId` 由会话传入，
+     需上层（小程序/网关）保证身份正确。
 2. **真实 LLM 未验证**：`openai_compat` 按 OpenAI 协议实现（含宽松 JSON 解析、
    流式 SSE、tool_calls），但没有真实 Key 跑过端到端。切换后建议先跑
    `--provider openai_compat --backend live` 观察指标。
-3. **评测延迟不代表真实性能**：mock LLM + 进程内后端是 0.8ms 量级；
-   首 Token 延迟（蓝图 §7 目标 <1.5s）本脚本不评测，由 SSE 接口的流式路径覆盖
-   （`/chat` 会在 `done` 事件里给出 `first_token_ms`）。
+3. **评测延迟不代表真实性能**：mock LLM + 进程内后端是 ~1ms 量级；
+   真机实测单次检索约 3~150ms（取决于检索引擎）。首 Token 延迟
+   （蓝图 §7 目标 <1.5s）本脚本不评测，由 SSE 流式路径覆盖
+   （`/chat` 的 `done` 事件给出 `first_token_ms`）。
 4. **记忆是进程内的**：多实例部署会话不共享，需要换 Redis 实现
    （`session_store` / `reader_profile` 的接口保持不变即可替换）。
 5. **相关性问题**：纯词法检索存在词面巧合导致的误召回。
@@ -391,7 +459,7 @@ agent-service/
 
 ---
 
-## 11. 常见问题
+## 12. 常见问题
 
 **Q：起服务时提示 Java 后端连不上？**
 A：正常。服务本身不依赖后端存活，工具调用会走熔断/降级并返回中文话术。

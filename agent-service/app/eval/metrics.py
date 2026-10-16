@@ -232,7 +232,7 @@ def to_markdown(metrics: dict[str, Any], breakdown: dict[str, Any], failures: li
         target = SLO.get(key)
         slo_entry = metrics["slo"].get(key, {})
         passed = slo_entry.get("pass")
-        mark = "—" if passed is None else ("✅" if passed else "❌")
+        mark = "—" if passed is None else ("[达标]" if passed else "[未达标]")
         show = "—" if value is None else (f"{value:.2%}" if value <= 1 else f"{value}")
         target_text = "—" if target is None else f"{target:.0%}"
         lines.append(

@@ -829,7 +829,7 @@ class AgentRuntime:
         claimed_reader = slots.get("claimed_reader_id")
         effective_reader = claimed_reader if claimed_reader is not None else reader_id
         title = slots.get("book_title") or ""
-        # ⚠️ 绝不在这里回退到"书名→id 的本地映射表"。
+        # [注意] 绝不在这里回退到"书名→id 的本地映射表"。
         # 那张表只是离线假后端的数据，真实后端里 id 完全不同，回退会让
         # get_stock/borrow 拿着不存在的 id 去打后端（实测 404：图书不存在：id=102）。
         book_id = self._resolve_book_id(slots, title)
@@ -1215,7 +1215,7 @@ class AgentRuntime:
             if data.get("bookId") is not None:
                 slots["book_id"] = data.get("bookId")
                 slots["_book_id_source"] = "get_stock"
-            # ⚠️ **不要**用库存返回的 title 覆盖 book_title：
+            # [注意] **不要**用库存返回的 title 覆盖 book_title：
             # book_title 是"读者问的那本书"，是后续步骤做书名→id 解析的依据。
             # 一旦被覆盖成上一本书的标题，多步流程里后面的 borrow/renew 会拿着
             # 错误的书名去解析（实测："帮我借《机器学习》，再查信用分"里的借阅

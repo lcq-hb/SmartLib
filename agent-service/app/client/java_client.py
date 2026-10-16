@@ -188,7 +188,7 @@ def sign_request(
 def build_query_string(params: Mapping[str, Any] | None) -> str:
     """把查询参数拼成"未编码"的展示形式。
 
-    ⚠️ **不要用它去算签名**。签名必须覆盖 httpx 实际发出的、百分号编码后的请求目标
+    [注意] **不要用它去算签名**。签名必须覆盖 httpx 实际发出的、百分号编码后的请求目标
     （服务端 `getQueryString()` 看到的形态），所以 `JavaClient.request` 是
     先 `client.build_request(...)` 再用 `request.url.raw_path` 取编码后的串。
     这个函数只用于日志/调试展示与单元测试里构造可读的期望值。
