@@ -137,8 +137,8 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: "6379"
       # 生产默认 redis-lua；压测脚本会用 /api/admin/stock-strategy 运行期切换
-      SMARTLIB_STOCK_STRATEGY: ${STOCK_STRATEGY:-redis-lua}
-      SEARCH_ENGINE: ${SEARCH_ENGINE:-inverted-index}
+      SMARTLIB_STOCK_STRATEGY: ${SMARTLIB_STOCK_STRATEGY:-redis-lua}
+      SMARTLIB_SEARCH_ENGINE: ${SMARTLIB_SEARCH_ENGINE:-inverted-index}
       # Agent 服务调用 /internal/** 用的 HMAC 密钥，两个后端实例必须一致
       SMARTLIB_INTERNAL_SIGN: ${SMARTLIB_INTERNAL_SIGN:-dev-internal-secret-please-change}
       # 压测需要运行期切换策略/引擎，因此打开管理端点（生产应关闭或加鉴权）
@@ -194,8 +194,8 @@ services:
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-smartlib}
       REDIS_HOST: redis
       REDIS_PORT: "6379"
-      SMARTLIB_STOCK_STRATEGY: ${STOCK_STRATEGY:-redis-lua}
-      SEARCH_ENGINE: ${SEARCH_ENGINE:-inverted-index}
+      SMARTLIB_STOCK_STRATEGY: ${SMARTLIB_STOCK_STRATEGY:-redis-lua}
+      SMARTLIB_SEARCH_ENGINE: ${SMARTLIB_SEARCH_ENGINE:-inverted-index}
       SMARTLIB_INTERNAL_SIGN: ${SMARTLIB_INTERNAL_SIGN:-dev-internal-secret-please-change}
       SMARTLIB_ADMIN_ENABLED: ${SMARTLIB_ADMIN_ENABLED:-true}
       JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -XX:+UseG1GC -Dfile.encoding=UTF-8 -Duser.timezone=Asia/Shanghai"
@@ -241,8 +241,8 @@ services:
         condition: service_healthy
     environment:
       LLM_PROVIDER: ${LLM_PROVIDER:-mock}
-      SMARTLIB_BACKEND_BASE_URL: http://backend-1:8080
-      SMARTLIB_INTERNAL_SIGN: ${SMARTLIB_INTERNAL_SIGN:-dev-internal-secret-please-change}
+      JAVA_BASE_URL: http://backend-1:8080
+      INTERNAL_SIGN_SECRET: ${SMARTLIB_INTERNAL_SIGN:-dev-internal-secret-please-change}
       LOG_LEVEL: INFO
       TZ: Asia/Shanghai
     ports:
@@ -284,8 +284,8 @@ services:
         condition: service_healthy
     environment:
       LLM_PROVIDER: ${LLM_PROVIDER:-mock}
-      SMARTLIB_BACKEND_BASE_URL: http://backend-2:8080
-      SMARTLIB_INTERNAL_SIGN: ${SMARTLIB_INTERNAL_SIGN:-dev-internal-secret-please-change}
+      JAVA_BASE_URL: http://backend-2:8080
+      INTERNAL_SIGN_SECRET: ${SMARTLIB_INTERNAL_SIGN:-dev-internal-secret-please-change}
       LOG_LEVEL: INFO
       TZ: Asia/Shanghai
     ports:

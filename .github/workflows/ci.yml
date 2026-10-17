@@ -149,9 +149,11 @@ jobs:
       - name: Run pytest
         working-directory: agent-service
         # LLM_PROVIDER=mock：CI 里没有 API Key，必须走 MockLLM 才能全绿
+        # JAVA_BASE_URL 才是 Agent 实际读取的变量名（config.py 的 java_base_url）；
+        # 写成 SMARTLIB_BACKEND_BASE_URL 会被静默忽略，只退回默认值。
         env:
           LLM_PROVIDER: mock
-          SMARTLIB_BACKEND_BASE_URL: http://127.0.0.1:8080
+          JAVA_BASE_URL: http://127.0.0.1:8080
         run: python -m pytest -q
 
       - name: Upload pytest artifacts

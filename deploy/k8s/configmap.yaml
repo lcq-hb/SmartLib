@@ -8,7 +8,7 @@
 # 与 Spring Boot 的映射关系（relaxed binding）：
 #   MYSQL_HOST          -> ${MYSQL_HOST:mysql}          （application-prod.yml 里显式引用）
 #   SMARTLIB_STOCK_STRATEGY -> smartlib.stock.strategy  （下划线转点，大小写不敏感）
-#   SEARCH_ENGINE       -> smartlib.search.engine
+#   SMARTLIB_SEARCH_ENGINE  -> smartlib.search.engine（application-prod.yml 用显式占位符，名字必须逐字一致）
 #   SMARTLIB_ADMIN_ENABLED -> smartlib.admin.enabled    （压测需要运行期切策略）
 #
 # 注意：K8s 的 env 一旦显式声明某个变量，就不会再去读 ConfigMap 里同名 key，
@@ -43,12 +43,17 @@ data:
   #                      version-retry | redis-lua | mq-serial
   SMARTLIB_STOCK_STRATEGY: "redis-lua"
   # 检索引擎合法值：like | inverted-index | elasticsearch
-  SEARCH_ENGINE: "inverted-index"
+  SMARTLIB_SEARCH_ENGINE: "inverted-index"
   # 压测/演示时用 /api/admin/stock-strategy 运行期切策略；生产应改回 false
   SMARTLIB_ADMIN_ENABLED: "true"
 
   # ---------------------------- Agent 服务 ----------------------------------
   LLM_PROVIDER: "mock"
-  SMARTLIB_BACKEND_BASE_URL: "http://backend.smartlib.svc.cluster.local:8080"
+  # 注意：Agent 读的是 JAVA_BASE_URL（对应 config.py 的 java_base_url 字段），
+  # 写成 SMARTLIB_BACKEND_BASE_URL 不会被读取 —— 默认值恰好也是本机 8080，
+  # 所以这类写错在本地永远看不出来，但在集群里会让 Agent 去连自己。
+  JAVA_BASE_URL: "http://backend.smartlib.svc.cluster.local:8080"
   LOG_LEVEL: "INFO"
-  UVICORN_WORKERS: "2"
+  # 刻意不设 UVICORN_WORKERS：Agent 目前是单进程设计。
+  # 会话记忆与读者画像存在进程内，起多 worker 会让同一会话落到不同进程上、
+  # 记忆随机丢失；要横向扩容必须先把 memory 换成 Redis（接口已预留）。

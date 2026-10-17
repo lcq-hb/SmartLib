@@ -36,10 +36,10 @@ spring:
 smartlib:
   # 生产默认使用 Redis + Lua 原子预扣，Redis 故障时自动降级为 DB 条件更新
   stock:
-    strategy: ${STOCK_STRATEGY:redis-lua}
+    strategy: ${SMARTLIB_STOCK_STRATEGY:redis-lua}
     degrade-on-redis-failure: true
   search:
-    engine: ${SEARCH_ENGINE:inverted-index}
+    engine: ${SMARTLIB_SEARCH_ENGINE:inverted-index}
   internal:
     sign-secret: ${SMARTLIB_INTERNAL_SIGN}
 

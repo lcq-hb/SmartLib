@@ -349,7 +349,11 @@ if (-not $SkipAgent) {
             # no API key is required: mock LLM + backend on localhost.
             $agentEnv = @{
                 "LLM_PROVIDER" = "mock"
-                "SMARTLIB_BACKEND_BASE_URL" = "http://127.0.0.1:$BackendPort"
+                # 必须用 JAVA_BASE_URL：这是 config.py 里 java_base_url 对应的环境变量名。
+                # 之前写成 SMARTLIB_BACKEND_BASE_URL 不会被读取，导致 -BackendPort
+                # 换端口时 Agent 仍然连默认的 8080（静默失效，最难查的那种）。
+                "JAVA_BASE_URL" = "http://127.0.0.1:$BackendPort"
+                "INTERNAL_SIGN_SECRET" = "dev-internal-secret-please-change"
             }
             foreach ($key in $agentEnv.Keys) {
                 Set-Item -Path ("Env:" + $key) -Value $agentEnv[$key]

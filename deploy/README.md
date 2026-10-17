@@ -228,10 +228,16 @@ docker compose down -v                # 连数据卷一起删（下次启动会�
 MYSQL_ROOT_PASSWORD=root
 MYSQL_USER=smartlib
 MYSQL_PASSWORD=smartlib
-STOCK_STRATEGY=redis-lua
-SEARCH_ENGINE=inverted-index
+# 策略与引擎的值必须与 StockStrategy.name() / SearchEngine.name() 逐字一致（短横线）：
+#   库存策略 optimistic-db | pessimistic-db | version-retry | local-lock | redis-lua | mq-serial
+#   检索引擎 like | inverted-index | elasticsearch
+# 写成 optimistic_db / inverted_index 不会报错，只会静默退回默认值
+# —— 这类"变量名/取值写错但不报错"的问题由 scripts/tools/check_env_names.py 在 CI 里守住。
+SMARTLIB_STOCK_STRATEGY=optimistic-db
+SMARTLIB_SEARCH_ENGINE=inverted-index
 SMARTLIB_ADMIN_ENABLED=true
 SMARTLIB_INTERNAL_SIGN=dev-internal-secret-please-change
+INTERNAL_SIGN_SECRET=dev-internal-secret-please-change
 LLM_PROVIDER=mock
 ```
 
