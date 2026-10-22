@@ -8,6 +8,7 @@
 [![MyBatis](https://img.shields.io/badge/MyBatis-4.1.0-red)](https://mybatis.org/)
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688)](https://fastapi.tiangolo.com/)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
 
@@ -35,7 +36,7 @@
 | 问题 | 候选方案 | 默认选型 | 落地位置 |
 |---|---|---|---|
 | **P1 库存超卖** | ①单机锁 ②DB 条件更新 ③DB 悲观锁 ④乐观锁 version 重试 ⑤Redis+Lua 原子预扣 ⑥MQ 串行化 | ② DB 条件更新（正确性优先、组件最少） | `service/stock/` 六种实现，同一 SPI，配置切换 |
-| **P2 检索慢** | ①`like %%` 基线 ②前缀索引 ③**自研倒排索引** ④MySQL ngram 全文索引 ⑤Elasticsearch | ③ 自研倒排（零外部依赖、可解释） | `service/search/` 五个引擎实现同一 `SearchEngine` 接口 |
+| **P2 检索慢** | ①`like %%` 基线 ②前缀索引 ③**自研倒排索引** ④MySQL ngram 全文索引 ⑤Elasticsearch | ③ 自研倒排（零外部依赖、可解释） | `service/search/` 三个实现同一 `SearchEngine` 接口（`like` 基线 / 自研倒排 / ES），默认用自研倒排 |
 | **P3 单点故障** | ①无状态化 ②多实例+Nginx ③Nacos ④令牌桶限流 ⑤熔断降级 ⑥幂等+优雅停机+探针 | 全部落地（分层防御） | `support/`、`web/`、`deploy/` |
 | **P4 服务台压力** | ①纯 Prompt ②Function Calling ③RAG ④Plan-Execute ⑤规则路由+LLM 兜底 | ⑤ 混合模式（高频走规则，长尾走 LLM） | `agent-service/app/agent/` |
 | **P5 人工催还** | ①定时扫描落库罚金 ②实时计算 ③消息推送 | ① 定时扫描（查询接口保持纯读） | `service/ScheduledTasks.java` |
@@ -361,3 +362,11 @@ Elasticsearch 引擎（本机未部署 ES）· Redis+Lua 的**真实成功路径
 `scripts/mvn.ps1` 直接调用 Maven 的 classworlds launcher，参数由 PowerShell 以 Unicode 传给 `java.exe`，中文路径完全安全。它同时把本地仓库固定在 `.tools/m2repo`，避免污染全局环境。
 
 如果你把项目放在纯 ASCII 路径下，直接用 `mvn` 也没有任何问题。
+
+---
+
+## 10. 许可证
+
+[MIT](LICENSE)。可以自由使用、修改、分发，保留版权声明即可。
+
+> 仓库里的 `docs/10-简历话术与面试问答.md` 是作者为自己准备面试写的材料，随项目一起公开只是为了展示完整的工程过程；如果你要参考这个项目，代码按 MIT 使用，那份材料建议按你自己的经历重写。
