@@ -6,10 +6,13 @@ import com.smartlib.domain.dto.Dtos.SearchResult;
 /**
  * 检索引擎 SPI。
  *
- * <p>五种方案的对比（Q1~Q5）全部实现这一个接口，因此：
+ * <p>蓝图里的 Q1~Q5 是<b>方案对比</b>，落到代码上目前有 3 个实现：
+ * {@code like}（基线）、{@code inverted-index}（自研倒排）、{@code elasticsearch}。
+ * 其中前两个用于实测对比；前缀索引（Q2）与 MySQL ngram（Q4）只做了方案比较，没有实现。
+ * 三个实现都收在这一个接口后面，因此：
  * <ul>
  *   <li>切换引擎只改配置 {@code smartlib.search.engine}，业务代码零改动；</li>
- *   <li>压测脚本可以用同一批请求跑完所有引擎，得到可直接对比的数据；</li>
+ *   <li>压测脚本可以用同一批请求跑完所有<b>已实现</b>的引擎，得到可直接对比的数据；</li>
  *   <li>其中一个引擎故障时可以降级到另一个（如倒排索引异常 → 降级 DB 直查）。</li>
  * </ul>
  *

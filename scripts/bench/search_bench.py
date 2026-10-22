@@ -4,11 +4,14 @@
 SmartLib 检索接口压测脚本（纯标准库，零依赖）
 
 测什么
-    并发 GET /api/books?query=...，对比 §6.2 五种检索方案（Q1~Q5）的表现：
+    并发 GET /api/books?query=...，对比 §6.2 检索方案（Q1 `like` 基线 / Q3 自研倒排）的表现：
       * QPS / P50 / P90 / P99 / 最大耗时
       * 错误率（HTTP 状态码 + 业务 code）
       * --recall-check 打开时：对人工标注集计算召回率
         （命中期望 id 的比例，判据来自蓝图 §7"检索召回率 >= 95%"）
+
+    注意：Q2 前缀索引、Q4 MySQL ngram 只做了方案对比，没有实现；
+    Q5 Elasticsearch 有实现但需要外部集群，本机未部署，因此默认不纳入对比。
 
 关于 --engine 参数
     后端的检索引擎可以通过管理接口运行期切换（PUT /api/admin/search-engine?name=like），
