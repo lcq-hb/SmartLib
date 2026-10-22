@@ -8,7 +8,7 @@
 # scripts/mvn.ps1 —— 项目专用 Maven 启动器
 #
 # 为什么不用官方 mvn.cmd：
-#   本项目路径包含中文字符（...\简历项目\...），mvn.cmd 是批处理脚本，
+#   本项目路径包含中文字符（...\项目目录\...），mvn.cmd 是批处理脚本，
 #   参数会经过 cmd.exe 的代码页转换，导致 -Dmaven.repo.local 等属性被丢弃，
 #   Maven 会回退到默认的 %USERPROFILE%\.m2 仓库。
 #   这里直接调用 Maven 的 classworlds launcher，参数由 PowerShell 以 Unicode

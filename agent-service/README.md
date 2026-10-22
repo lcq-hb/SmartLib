@@ -12,7 +12,7 @@
 ## 1. 五分钟跑起来（不需要任何 API Key）
 
 ```powershell
-cd C:\Users\<user>\Desktop\简历项目\agent-service
+cd <仓库根>\agent-service
 
 # 1) 起服务（默认 mock LLM + 内存会话，Java 后端没起也能启动）
 & '.\.venv\Scripts\python.exe' -m uvicorn app.main:app --port 8000
@@ -60,8 +60,8 @@ $env:LLM_MODEL='deepseek-chat'                     # 或 qwen-plus / 本地模�
 ## 3. 跑测试
 
 ```powershell
-$env:PYTHONPATH='C:\Users\<user>\Desktop\简历项目\.tools\pylibs'
-& 'C:\Users\<user>\Desktop\简历项目\agent-service\.venv\Scripts\python.exe' -m pytest tests -q
+$env:PYTHONPATH='<仓库根>\.tools\pylibs'
+& '<仓库根>\agent-service\.venv\Scripts\python.exe' -m pytest tests -q
 ```
 
 **当前实测结果：`303 passed`（约 10 秒）。**
@@ -85,7 +85,7 @@ LLM 用 MockLLM，**没有一个用例需要启动真实服务**。
 ## 4. 跑评测
 
 ```powershell
-$env:PYTHONPATH='C:\Users\<user>\Desktop\简历项目\.tools\pylibs'
+$env:PYTHONPATH='<仓库根>\.tools\pylibs'
 & '.\.venv\Scripts\python.exe' -m app.eval.run_eval --provider mock
 ```
 

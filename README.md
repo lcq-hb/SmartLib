@@ -356,7 +356,7 @@ Elasticsearch 引擎（本机未部署 ES）· Redis+Lua 的**真实成功路径
 
 ## 9. 为什么有 `scripts/mvn.ps1`
 
-本项目的开发路径包含中文字符（`...\简历项目\...`）。官方的 `mvn.cmd` 是批处理脚本，参数会经过 `cmd.exe` 的代码页转换，导致 `-Dmaven.repo.local` 等属性被丢弃、Maven 回退到默认的 `~/.m2` 仓库。
+本项目的开发路径包含中文字符（`...\项目目录\...`）。官方的 `mvn.cmd` 是批处理脚本，参数会经过 `cmd.exe` 的代码页转换，导致 `-Dmaven.repo.local` 等属性被丢弃、Maven 回退到默认的 `~/.m2` 仓库。
 
 `scripts/mvn.ps1` 直接调用 Maven 的 classworlds launcher，参数由 PowerShell 以 Unicode 传给 `java.exe`，中文路径完全安全。它同时把本地仓库固定在 `.tools/m2repo`，避免污染全局环境。
 
