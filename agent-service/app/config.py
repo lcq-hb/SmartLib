@@ -5,7 +5,7 @@
    FastAPI 依赖注入、评测脚本（`python -m app.eval.run_eval`）和 pytest 里可用，
    集中一处可以避免"测试里改了环境变量但业务代码读的是另一份缓存"的经典坑。
 2. 所有有默认值的项都必须让服务在**零 Key、零外部依赖**下启动，
-   这样 CI / 面试官本机 / 断网的演示环境都能跑通（蓝图 §3.2 明确要求 MockLLM）。
+   这样 CI / 评审者本机 / 断网的演示环境都能跑通（蓝图 §3.2 明确要求 MockLLM）。
 3. 用 lru_cache 暴露 get_settings()，同一个进程只解析一次；
    测试中需要覆盖配置时调用 `get_settings.cache_clear()`。
 """

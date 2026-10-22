@@ -49,7 +49,7 @@
 **理由**
 1. **已验证而非假设**：`spike/pom.xml` 以 `spring-boot-starter-parent:4.1.1` + `java.version=21` + `mybatis-spring-boot-starter:4.1.0` 的组合跑通了「H2 `MODE=MySQL` + MyBatis + REST + 集成测试」，风险已被前置消解。
 2. **Java 21 是 LTS 且语法收益实在**：`record`（本项目全部 DTO 采用）、模式匹配 `switch`（错误码与枚举分发）、虚拟线程（可选的 DB 调用优化路径）、文本块（MyBatis SQL 说明与测试断言可读性）。Java 25 虽为 LTS 但生态适配尚新，只作为运行环境而非字节码基线。
-3. **Spring Boot 4.x 是当前主流代际**：选择 4.1.1 而非 3.x，使项目的依赖治理（如 Jakarta EE 命名空间、新的自动配置机制）与技术面试中的"当前主流"对齐；同时它带来的兼容风险通过 spike 已被验证覆盖。
+3. **Spring Boot 4.x 是当前主流代际**：选择 4.1.1 而非 3.x，使项目的依赖治理（如 Jakarta EE 命名空间、新的自动配置机制）与技术选型中的"当前主流"对齐；同时它带来的兼容风险通过 spike 已被验证覆盖。
 4. **Actuator/Micrometer/Prometheus 开箱即用**，直接满足蓝图 §7 的可观测性目标，无需额外造轮子。
 
 **被否决的替代方案及否决原因**
@@ -95,7 +95,7 @@
 使用 **`mybatis-spring-boot-starter:4.1.0`**，SQL 以 XML（`resources/mapper/*.xml`）为主、简单查询用注解；不引入 JPA/Hibernate，不使用 MyBatis-Plus。
 
 **理由**
-1. **条件更新必须手写而且要写对**：库存扣减的正确性核心是 `update book_stock set available_copies = available_copies - #{n} where book_id = #{bookId} and available_copies >= #{n}`。这条语句的语义（`where` 中的下界判断 + 原子递减）是防超卖的根，MyBatis 让它以最直白的形式存在于代码里，便于 CodeReview 与面试讲解；JPA 下需要绕过 QueryDSL/原生 SQL 才能表达，反而增加理解成本。
+1. **条件更新必须手写而且要写对**：库存扣减的正确性核心是 `update book_stock set available_copies = available_copies - #{n} where book_id = #{bookId} and available_copies >= #{n}`。这条语句的语义（`where` 中的下界判断 + 原子递减）是防超卖的根，MyBatis 让它以最直白的形式存在于代码里，便于 CodeReview 与设计讲解；JPA 下需要绕过 QueryDSL/原生 SQL 才能表达，反而增加理解成本。
 2. **规避字节码增强风险**：Hibernate 的懒加载代理、一级/二级缓存、脏检查都会在调试期制造"看到的现象与代码不一致"的问题；本项目强调可预测、可解释，禁用运行期织入（02 概设约束 C3）。
 3. **慢查询优化需要 SQL 级可见性**：`like '%kw%'` 全表扫描 120 万行（现状基线 2.8s）这类问题，只有在 SQL 由自己书写时，优化动作（改索引、改写法、换引擎）才是可控可讲的。
 4. **已在 spike 验证**：`mybatis-spring-boot-starter:4.1.0` + H2 `MODE=MySQL` 的集成测试跑通，配置极简（只需 `map-underscore-to-camel-case: true`）。
@@ -146,7 +146,7 @@ Java 实体与 DTO 的 getter/setter/构造器/`toString`/`equals` 样板代码�
 **理由**
 1. **`record` 已覆盖 80% 的样板代码消除需求**：本项目 DTO 全部不可变（`BookQuery`、`BorrowCommand`、`BorrowResult`、`StockView`、`ReaderProfile`），`record` 原生提供构造器、访问器、`equals/hashCode/toString`，零依赖、零注解处理器。
 2. **消除构建链风险**：Lombok 与编译器版本的耦合是长期痛点（新 JDK 上的处理器适配滞后），移除它意味着 `mvn test` 的失败原因集合显著收窄——这对一个要在 CI 上稳定全绿的项目价值很高。
-3. **可读性优先**：实体只有 8 个（`Book`、`BookStock`、`Category`、`Reader`、`BorrowRecord`、`Reservation`、`StockLedger`、`RuleConfig`），手写访问器的绝对成本可控；显式代码在面试讲解与调试时无"魔法"。
+3. **可读性优先**：实体只有 8 个（`Book`、`BookStock`、`Category`、`Reader`、`BorrowRecord`、`Reservation`、`StockLedger`、`RuleConfig`），手写访问器的绝对成本可控；显式代码在设计讲解与调试时无"魔法"。
 4. **避免隐式行为**：`@Data`/`@Builder` 的默认语义（可变性、`equals` 用哪几个字段、`toString` 泄漏敏感字段）需要额外配置与认知成本。
 
 **被否决的替代方案及否决原因**
@@ -255,7 +255,7 @@ update book_stock
 **自研** `TokenBucketRateLimiter` + `CircuitBreaker`（CLOSED/OPEN/HALF_OPEN 三态）+ `DegradeFallback`，放在 `com.smartlib.support` 包；同时**保留 Resilience4j 的等价配置**写入 [`docs/09-多种解决方案对比手册.md`](./09-多种解决方案对比手册.md) 作为对照方案。
 
 **理由**
-1. **项目要证明的是"理解原理"而非"会引依赖"**：自研状态机可以白盒讲解失败率窗口、冷却时间、半开探测计数、令牌补充速率与突发容量，面试追问抗压能力显著更强。
+1. **项目要证明的是"理解原理"而非"会引依赖"**：自研状态机可以白盒讲解失败率窗口、冷却时间、半开探测计数、令牌补充速率与突发容量，面对追问时的说服力显著更强。
 2. **需求面窄，自研代码量可控**：本项目只需要令牌桶限流 + 三态熔断 + 降级兜底，不需要 Sentinel 的热点参数限流、集群流控、控制台规则推送等重型能力；自研总量在数百行量级。
 3. **零新增依赖 = 零版本适配风险**：Resilience4j/Sentinel 对 Spring Boot 4.1.1 的适配需要额外验证，而自研只依赖 JDK 与 Spring 核心；这与ADR-003 的取舍逻辑一致（收窄构建链风险）。
 4. **需要按作用域定制**：内部 `/internal/agent/**` 需要与公共 API 隔离的独立桶，依赖级熔断需要按 `name` 独立状态（DB、Redis、检索、Agent→后端各自一个），自研更容易与指标（`smartlib_circuit_state`、`smartlib_rate_limited_total{scope}`）直接绑定。
@@ -577,7 +577,7 @@ Agent 服务的真实能力依赖 LLM（DeepSeek/通义/本地 vLLM）。但一�
 1. **零 Key 可完整演示**：`mvn test`、`pytest`、Docker Compose 起全栈、SSE 流式对话、8 个内部工具调用、护栏拦截、评测脚本——全部无需 API Key，符合约束 C7。
 2. **CI 必须确定性**：真实 LLM 输出不确定，无法做断言。MockLLM 是确定性函数，可对"意图识别 → 工具选择 → 参数构造 → 回答结构"做精确断言，让 `pytest` 成为真正的回归网。
 3. **评测需要可对比基线**：MockLLM 给出"工程链路正确率"的上界基线（链路本身没问题时，Mock 应当接近满分）；真实 provider 的差距才反映模型能力，二者分离才能定位问题在链路还是在模型。
-4. **演示与故障的韧性**：课堂上/面试中网络不可控。`openai_compat` 失败自动回退 mock，保证"永远能演示完"。
+4. **演示与故障的韧性**：课堂演示或评审现场网络不可控。`openai_compat` 失败自动回退 mock，保证"永远能演示完"。
 5. **实现成本极低、收益明确**：MockLLM 只需覆盖有限意图与 8 个工具的确定性选择，代码量小；换来的是可测试性与可演示性的巨大提升。
 
 **被否决的替代方案及否决原因**
