@@ -139,7 +139,7 @@ curl -N -X POST http://localhost:8000/chat \
 powershell -ExecutionPolicy Bypass -File scripts/start-local.ps1
 ```
 
-### 4.4 演示控制台（面试演示用）
+### 4.4 演示控制台
 
 两个服务都起来之后，直接打开：
 

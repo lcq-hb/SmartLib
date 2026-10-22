@@ -59,7 +59,7 @@ report.json
 deploy/sql/generated/
 !deploy/sql/generated/.gitkeep
 # 基准测试的"每次运行产物"不入库（随环境波动），但**汇总报告要入库**：
-# 它是项目"零超卖 / 检索提速"这些结论的实测证据，面试时可直接展示。
+# 它是"零超卖 / 检索提速"这些结论的实测证据，可直接用于成果展示。
 # 注意：必须先排除目录内容再逐一放行，否则 git 不会进入被排除的目录。
 scripts/bench/results/*
 !scripts/bench/results/.gitkeep
