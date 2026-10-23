@@ -271,6 +271,20 @@ class JavaClient:
                 timeout=httpx.Timeout(self.settings.java_timeout_seconds),
                 limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
                 transport=self._transport,
+                # 【必须显式关闭】不读系统代理。
+                #
+                # 踩过的坑：开发机装了代理/加速器（Windows 上写在注册表里，
+                # os.environ 看不到，但 urllib.request.getproxies() 能读到），
+                # httpx 默认 trust_env=True 会把 **本机 127.0.0.1 的请求也发给代理**，
+                # 代理不认识这个内部路径，直接回一个 HTML 403/502：
+                #   <html>...<center>403 Forbidden</center>...<center>Apple</center>
+                # 症状极具误导性：后端日志里干干净净（请求根本没到），
+                # 前端却报"图书馆系统拒绝了这次请求（403）"。
+                #
+                # 服务间调本机后端不应该走代理，这条对所有内网调用都成立。
+                # 注意：调用**外部**大模型 API 的客户端（openai_compat）不能关这个开关，
+                # 否则在必须通过代理出网的机器上会连不上。
+                trust_env=False,
             )
         return self._client
 

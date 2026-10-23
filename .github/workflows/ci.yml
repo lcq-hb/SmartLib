@@ -11,9 +11,12 @@
 #      在 Linux runner 上没有意义，而且 Linux 上 mvn 的参数传递本来就正常。
 #   4) 用 actions/setup-java 的 cache: maven + cache-dependency-path 指向 pom.xml，
 #      缓存的是 ~/.m2/repository（runner 上没有 .tools/m2repo 这个仓库隔离目录）。
-#   5) 【不是本文件职责的事】Docker 镜像构建与推送、Compose 起环境冒烟、
-#      压测（scripts/bench）都不放在 CI：压测需要稳定的机器与真实数据量，
-#      数字放进 CI 只会变成噪声。压测请按 docs/06 的流程在本机/压测机上手工跑。
+#   5) 【smoke job 的定位】前三个 job 只证明"代码能编译、测试能过"，证明不了"服务能起来"。
+#      这个项目里两次最严重的启动期错误（@Scheduled 不能带 initialDelay、Map.copyOf 不接受 null）
+#      都是**测试全绿、启动即炸**，靠真实启动才发现。所以 smoke job 会真的把后端打成 jar 跑起来、
+#      把 Agent 服务跑起来，再用 curl 打关键接口。
+#      Docker 镜像构建与推送、压测（scripts/bench）**仍然不放进 CI**：
+#      压测需要稳定机器与真实数据量，数字放进 CI 只会变成噪声。
 # =============================================================================
 name: CI
 
@@ -23,13 +26,17 @@ on:
     paths:
       - "backend/**"
       - "agent-service/**"
-      - ".github/workflows/ci.yml"
+      - "scripts/**"
+      - "deploy/sql/**"
+      - ".github/workflows/**"
   pull_request:
     branches: ["**"]
     paths:
       - "backend/**"
       - "agent-service/**"
-      - ".github/workflows/ci.yml"
+      - "scripts/**"
+      - "deploy/sql/**"
+      - ".github/workflows/**"
   # 允许在 Actions 页面手工触发（排查环境问题时很有用）
   workflow_dispatch:
 
@@ -164,5 +171,136 @@ jobs:
           path: |
             agent-service/.pytest_cache/**
             agent-service/app/eval/report.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ===========================================================================
+  # 冒烟：真的把双服务启动起来，再用 curl 打关键接口
+  #
+  # 为什么值得单独一个 job：
+  #   编译通过 + 测试全绿 ≠ 服务能起来。本项目两次启动期崩溃
+  #   （@Scheduled 配 initialDelay、Map.copyOf 遇到 null）都是测试全绿、启动即炸。
+  #   这个 job 就是那道防线：服务起不来、接口返 5xx、幂等失效、对账不平，这里都会红。
+  #
+  # 依赖：零外部依赖。后端用 local profile（H2 内存库，启动时自动建表灌种子数据），
+  #       Agent 用 MockLLM（不需要 API Key），因此 runner 上不需要 MySQL/Redis。
+  # ===========================================================================
+  # ===========================================================================
+  # 冒烟：真的把双服务启动起来，再跑接口断言
+  #
+  # 为什么值得单独一个 job：
+  #   编译通过 + 测试全绿 != 服务能起来。本项目两次启动期崩溃
+  #   （@Scheduled 配 initialDelay、Map.copyOf 遇到 null）都是测试全绿、启动即炸。
+  #   这个 job 就是那道防线：服务起不来、接口 5xx、幂等失效、对账不平，这里都会红。
+  #
+  # 依赖：零外部依赖。后端用 local profile（H2 内存库，启动自动建表灌种子数据），
+  #       Agent 用 MockLLM（不需要 API Key），因此 runner 上不需要 MySQL / Redis。
+  #
+  # 断言逻辑放在 scripts/ci/smoke_check.py（纯标准库），不在 YAML 里内联 python：
+  #   YAML 的 run: | 块内每行都要缩进，而 heredoc 的结束符必须顶格，两者冲突会直接挂。
+  #   写成脚本后本地也能跑：`python scripts/ci/smoke_check.py all --key k1`
+  # ===========================================================================
+  smoke:
+    name: smoke (启动双服务 + 接口冒烟)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: guards
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: backend/pom.xml
+
+      - name: Package backend jar (跳过测试，测试在 backend job 已跑)
+        working-directory: backend
+        run: mvn -B -ntp -DskipTests package
+
+      - name: Start backend
+        run: |
+          JAR=$(ls backend/target/*.jar | head -1)
+          echo "jar = $JAR"
+          nohup java -jar "$JAR" > /tmp/backend.log 2>&1 &
+          echo $! > /tmp/backend.pid
+
+      - name: Wait for backend health (最多 90 秒)
+        run: |
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:8080/actuator/health > /tmp/health.json 2>/dev/null \
+               && grep -q '"status":"UP"' /tmp/health.json; then
+              echo "backend UP after ${i}s"; cat /tmp/health.json; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::后端 90 秒内没有 healthy"
+          tail -120 /tmp/backend.log
+          exit 1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: agent-service/requirements.txt
+
+      - name: Install agent dependencies
+        working-directory: agent-service
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Start agent service
+        working-directory: agent-service
+        env:
+          LLM_PROVIDER: mock
+          # 变量名必须是 JAVA_BASE_URL（config.py 的 java_base_url），
+          # 写成 SMARTLIB_BACKEND_BASE_URL 会被静默忽略、只退回默认值。
+          JAVA_BASE_URL: http://127.0.0.1:8080
+          # 与后端 application.yml 的 smartlib.internal.sign-secret 默认值一致
+          INTERNAL_SIGN_SECRET: dev-internal-secret-please-change
+        run: |
+          nohup python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > /tmp/agent.log 2>&1 &
+          echo $! > /tmp/agent.pid
+
+      - name: Wait for agent health (最多 60 秒)
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8000/health > /tmp/agent-health.json 2>/dev/null; then
+              echo "agent UP after ${i}s"; cat /tmp/agent-health.json; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Agent 60 秒内没有起来"
+          tail -120 /tmp/agent.log
+          exit 1
+
+      - name: Smoke 1 - 检索（中文 + 拼音首字母）
+        run: python3 scripts/ci/smoke_check.py search
+
+      - name: Smoke 2 - 借阅幂等（同一 Key 连发两次，只能扣一次）
+        run: python3 scripts/ci/smoke_check.py borrow --key "ci-${{ github.run_id }}-${{ github.run_attempt }}"
+
+      - name: Smoke 3 - 库存对账（守恒性）
+        run: python3 scripts/ci/smoke_check.py reconcile
+
+      - name: Smoke 4 - Agent 对话（走 HMAC 内部接口，回答必须有真实数据）
+        run: python3 scripts/ci/smoke_check.py chat
+
+      - name: Upload logs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs
+          path: |
+            /tmp/backend.log
+            /tmp/agent.log
+            /tmp/health.json
+            /tmp/agent-health.json
           if-no-files-found: ignore
           retention-days: 7
