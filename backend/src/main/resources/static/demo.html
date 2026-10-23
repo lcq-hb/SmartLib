@@ -407,6 +407,37 @@ function judgeIdempotency(first, second) {
     + "结论：" + (sameId && replay ? "同一个 Key 只扣了一次库存 ✔" : "不符合预期，请检查幂等实现 ✘"));
 }
 
+/* 第 1 次的响应要留着，第 2 次点完才有东西可对比。
+   为什么需要这个变量：单点「用同一个 Key 再借一次」时拿不到上一次的响应，
+   之前就漏了这一步 —— 两个按钮只发请求、从不渲染结论，
+   于是手动演示时只能看到裸 JSON，看不出"幂等到底生效没有"。 */
+let lastBorrowFirst = null;
+
+async function borrowFirst() {
+  // 每次"第 1 次"都换一个新键。幂等键是绑在"这一笔业务（读者+书目）"上的，
+  // 整场会话复用同一个键，换一本书再演示时会命中上一轮的记录，看起来像"白借成功"。
+  newIdemKey();
+  lastBorrowFirst = await doBorrow("第 1 次");
+  const d1 = (lastBorrowFirst.body || {}).data || {};
+  if (lastBorrowFirst.status !== 200) {
+    verdict($("borrowVerdict"), false, "第 1 次就没成功（HTTP " + lastBorrowFirst.status + "："
+      + ((lastBorrowFirst.body && lastBorrowFirst.body.msg) || lastBorrowFirst.text)
+      + "）。点「自动选一本可借的」换一本书，或重启后端恢复演示数据。");
+  } else {
+    verdict($("borrowVerdict"), true, "第 1 次成功，borrowId=" + d1.borrowId
+      + "。现在点「用同一个 Key 再借一次」——它应当返回同一个 borrowId 且 idempotentReplay=true。");
+  }
+}
+
+async function borrowSecond() {
+  if (!lastBorrowFirst) {
+    verdict($("borrowVerdict"), false, "请先点「第 1 次借书」：幂等的对比需要两次结果。");
+    return;
+  }
+  const second = await doBorrow("第 2 次（同 Key）");
+  judgeIdempotency(lastBorrowFirst, second);
+}
+
 /** 自动挑一本"该读者还没借、且当前可借"的书，避免演示时撞业务规则。 */
 async function pickAvailableBook() {
   const readerId = parseInt($("readerId").value, 10);
@@ -596,6 +627,7 @@ async function runAll() {
     log("      选中 bookId=" + $("bookId").value);
 
     log("[4/6] 借书两次（同一个幂等键）…");
+    newIdemKey();  // 每轮演示用新键，避免命中上一轮的记录
     const b1 = await doBorrow("第 1 次");
     const b2 = await doBorrow("第 2 次（同 Key）");
     judgeIdempotency(b1, b2);
@@ -632,8 +664,8 @@ $("btnRecheck").onclick = refreshStatus;
 $("btnSearch").onclick = () => doSearch($("searchQuery").value.trim(), "中文检索");
 $("btnPinyin").onclick = () => { $("searchQuery").value = "jsjwl"; return doSearch("jsjwl", "拼音首字母"); };
 $("btnPickBook").onclick = pickAvailableBook;
-$("btnBorrow1").onclick = () => doBorrow("第 1 次");
-$("btnBorrow2").onclick = () => doBorrow("第 2 次（同 Key）");
+$("btnBorrow1").onclick = borrowFirst;
+$("btnBorrow2").onclick = borrowSecond;
 $("btnReconcile").onclick = doReconcile;
 $("btnSwitchStrategy").onclick = doSwitchStrategy;
 $("btnStats").onclick = doStats;
