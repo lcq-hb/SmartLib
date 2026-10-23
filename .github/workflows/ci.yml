@@ -6,7 +6,7 @@
 #   2) 【路径过滤】只有相关目录变化才触发，避免改文档就烧掉 CI 额度。
 #      注意：如果把这个仓库做成"必需检查(required status check)"，
 #      path 过滤会让"未触发"的 job 永远显示 pending，那种场景请去掉 paths。
-#   3) 后端用 ubuntu-latest 上的标准 mvn，而不是仓库里的 scripts/mvn.ps1：
+#   3) 后端用 ubuntu-24.04 上预装的标准 mvn，而不是仓库里的 scripts/mvn.ps1：
 #      那个脚本是给 Windows 中文路径用的（直接调 classworlds 绕开 cmd.exe 代码页），
 #      在 Linux runner 上没有意义，而且 Linux 上 mvn 的参数传递本来就正常。
 #   4) 用 actions/setup-java 的 cache: maven + cache-dependency-path 指向 pom.xml，
@@ -58,14 +58,14 @@ jobs:
   # ===========================================================================
   guards:
     name: guards (SQL / 代码生成一致性)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -80,16 +80,16 @@ jobs:
   # ===========================================================================
   backend:
     name: backend (Java 21 + Maven)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs: guards
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           # pom.xml 的 <java.version>21</java.version>，用 21 与生产镜像(maven:3.9-eclipse-temurin-21)对齐
@@ -112,7 +112,7 @@ jobs:
       - name: Upload surefire reports
         # 失败时把测试报告留下来，否则只能靠日志猜是哪条用例挂了
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: backend-surefire-reports
           path: backend/target/surefire-reports/**
@@ -121,7 +121,7 @@ jobs:
 
       - name: Upload test summary (optional file)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: backend-jar
           path: backend/target/*.jar
@@ -133,15 +133,15 @@ jobs:
   # ===========================================================================
   agent:
     name: agent (Python 3.12 + pytest)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -165,7 +165,7 @@ jobs:
 
       - name: Upload pytest artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: agent-test-artifacts
           path: |
@@ -202,16 +202,16 @@ jobs:
   # ===========================================================================
   smoke:
     name: smoke (启动双服务 + 接口冒烟)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     needs: guards
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up JDK 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "21"
@@ -243,7 +243,7 @@ jobs:
           exit 1
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -294,7 +294,7 @@ jobs:
 
       - name: Upload logs (always)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: smoke-logs
           path: |
