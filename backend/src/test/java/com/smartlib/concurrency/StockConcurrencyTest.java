@@ -50,9 +50,20 @@ import com.smartlib.service.stock.StockStrategyFactory;
  * 成功数可能<b>少于</b>库存数（书没借完但请求已失败）。
  * 这个现象是乐观锁的固有代价，测试必须把它暴露出来而不是掩盖掉 ——
  * 因此对它的断言是"不超过库存"，而不是"必须借满"。
+ * <p><b>为什么测试必须钉死一个连不上的 Redis 端口</b>：
+ * {@code redis-lua} 的用例里有一条是"连续 3 次 Redis 失败后进入短路"。
+ * 它原本隐含假设"开发机上没有 Redis"——一旦开发者为了验证真实链路在本机装了 Redis
+ * （这是好事，FIX-06 就是这么发现的），这个断言就会因为"根本不会失败"而挂掉。
+ * 测试不能依赖宿主机的环境状态，所以这里显式把 Redis 指向一个没有监听的端口，
+ * 让"Redis 不可用"成为确定性前提。
  */
 @SpringBootTest
 @ActiveProfiles("test")
+@org.springframework.test.context.TestPropertySource(properties = {
+        "spring.data.redis.host=127.0.0.1",
+        // 6390 上没有服务：连接会被立即拒绝，短路逻辑必然被触发
+        "spring.data.redis.port=6390"
+})
 class StockConcurrencyTest {
 
     private static final Logger log = LoggerFactory.getLogger(StockConcurrencyTest.class);

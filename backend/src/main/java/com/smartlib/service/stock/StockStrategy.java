@@ -33,6 +33,30 @@ public interface StockStrategy {
     StockDeductResult tryDeduct(long bookId, int quantity, String bizNo);
 
     /**
+     * 归还（或扣减失败后的补偿）时，把额度还回该策略自己的加速结构。
+     *
+     * <p><b>为什么接口必须有这个方法</b>：扣减与归还是一对。只有扣减没有归还，
+     * 任何"把库存计数放在数据库之外"的策略都会漂移。实测缺陷（FIX-06）：
+     * {@code redis-lua} 策略借出 10 册再全部归还后，数据库回到 10，
+     * 但 Redis 的 {@code smartlib:stock:{id}} 停在 0，之后所有借阅都被 Lua
+     * 判成"库存不足"—— 账没算错（对账仍一致、零超卖），但<b>功能不可用</b>，
+     * 且要等 30 分钟 TTL 过期才自愈。降级开关也救不了：Redis 没有故障，
+     * 它只是如实回答"库存不足"，被当成合法业务拒绝。
+     *
+     * <p>默认空实现：以数据库为唯一事实来源的策略（条件更新、悲观锁、
+     * 乐观锁重试、本地锁、队列串行化）本来就不需要额外补偿。
+     *
+     * <p><b>实现约束</b>：回补失败绝不能抛异常 —— 归还本身已经成功，
+     * 回补失败最多让缓存额度暂时偏低，由 TTL 与对账任务兜底。
+     *
+     * @param bookId   书目 id
+     * @param quantity 回补数量，必须为正数
+     */
+    default void restore(long bookId, int quantity) {
+        // 数据库即事实来源，无需额外动作
+    }
+
+    /**
      * 该策略是否已在自己掌控的事务里写入了库存流水。
      * 默认 false：由 {@code StockService} 在同一个事务里统一写流水。
      */

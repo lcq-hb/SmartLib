@@ -152,6 +152,11 @@ public class StockService {
         }
         writeLedger(bookId, "RELEASE", quantity, before.getAvailableCopies(),
                 before.getAvailableCopies() + quantity, bizNo, "release");
+        // 归还必须把额度还回策略自己的加速结构（FIX-06）。
+        // 漏掉这一步的后果：redis-lua 策略借出 N 册再全部归还后，数据库回到原值，
+        // 但 Redis 预扣池停在 0，之后该书的借阅全部被 Lua 判成"库存不足"，
+        // 要等 30 分钟 TTL 过期才自愈。对账仍一致、不超卖，但功能不可用。
+        strategyFactory.current().restore(bookId, quantity);
         notifyChanged(bookId);
     }
 

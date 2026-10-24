@@ -56,6 +56,8 @@ public class RedisLuaStockStrategy implements StockStrategy {
     private final ObjectProvider<StringRedisTemplate> redisProvider;
     private final OptimisticDbStockStrategy fallback;
     private final DefaultRedisScript<Long> deductScript;
+    /** 归还/补偿时的额度回补脚本：只在 key 存在时 INCRBY，避免把未预热的 key 写成错误初值。 */
+    private final DefaultRedisScript<Long> restoreScript;
     private final boolean degradeOnRedisFailure;
 
     private final AtomicLong luaSuccess = new AtomicLong();
@@ -91,6 +93,9 @@ public class RedisLuaStockStrategy implements StockStrategy {
         this.deductScript = new DefaultRedisScript<>();
         this.deductScript.setLocation(new ClassPathResource("lua/stock_deduct.lua"));
         this.deductScript.setResultType(Long.class);
+        this.restoreScript = new DefaultRedisScript<>();
+        this.restoreScript.setLocation(new ClassPathResource("lua/stock_restore.lua"));
+        this.restoreScript.setResultType(Long.class);
     }
 
     @Override
@@ -219,6 +224,40 @@ public class RedisLuaStockStrategy implements StockStrategy {
             // 回滚失败也不能抛：下一轮预热会以数据库为准覆盖这个 key，
             // 兜底路径（数据库条件更新）仍然保证不会超卖。
             log.warn("Redis 预扣回滚失败 key={} qty={}", key, quantity, e);
+        }
+    }
+
+    /**
+     * 归还/补偿时把额度还回 Redis 预扣池。
+     *
+     * <p><b>为什么必须有这个实现（FIX-06）</b>：本策略把库存计数放在 Redis，
+     * 但归还路径原本只加数据库、不回补 Redis。实测复现：借出 10 册全部归还后，
+     * 数据库 available=10，而 {@code smartlib:stock:{id}}=0；之后任何借阅
+     * 都会拿到 Lua 的 {@code -2}（库存不足）并被拒——功能挂住，直到 TTL 过期。
+     *
+     * <p>用专用 Lua 脚本而不是直接 {@code INCRBY}：{@code INCRBY} 遇到不存在的 key
+     * 会创建它，把"未知库存"写成 1，反而比不回补更糟。脚本里先 {@code EXISTS} 再
+     * {@code INCRBY}，两步原子。key 不存在时不动它，交给下次借阅的 warmUp 从数据库预热。
+     */
+    @Override
+    public void restore(long bookId, int quantity) {
+        if (quantity <= 0) {
+            return;
+        }
+        StringRedisTemplate redis = redisProvider.getIfAvailable();
+        if (redis == null) {
+            return;
+        }
+        String key = KEY_PREFIX + bookId;
+        try {
+            Long after = redis.execute(restoreScript, List.of(key), String.valueOf(quantity));
+            if (after == null || after < 0) {
+                // -1 = key 不存在（未预热或已过期），交给 warmUp 处理，这不是错误
+                log.debug("Redis 库存 key 不存在，跳过回补 bookId={} qty={}", bookId, quantity);
+            }
+        } catch (Exception e) {
+            // 归还已经成功，回补失败不能反向影响业务；TTL 到期后会以数据库为准重新预热
+            log.warn("归还回补 Redis 预扣额度失败 key={} qty={}（等待 TTL 过期后重新预热）", key, quantity, e);
         }
     }
 
